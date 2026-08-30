@@ -123,9 +123,9 @@ RUN cd /ros_ws && \
 # uninstall. --ignore-installed is a per-invocation flag, which is why this is
 # a separate command rather than an extra argument on the one below — we do not
 # want it applied to everything.
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --ignore-installed PyYAML && \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    websockets webrtcvad
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    --ignore-installed pyyaml requests websockets webrtcvad websocket-client dashscope && \
+    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} silero-vad
 
 # ── VOP deps (YOLOv8-World object detection) ─────────────────────
 # Fix broken system cv2 __init__.py (mat_wrapper circular import on Jetson).
@@ -164,6 +164,13 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --no-deps "git+https://ghfast.
 # Pre-download CLIP weights into image (avoids 338MB download at runtime)
 RUN mkdir -p /work/weights/clip && \
     python3 -c "import urllib.request; urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/ViT-B-32.pt', '/work/weights/clip/ViT-B-32.pt')"
+
+# ── Face recognition deps (EdgeFace + MTCNN) ────────────────────
+# EdgeFace backbone (edgenext_small) is created via timm.create_model(); torch,
+# torchvision, Pillow and cv2 are already in the base image / VOP layer. timm is
+# installed --no-deps so it does not pull a different torch/torchvision wheel.
+RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} timm && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} "safetensors>=0.3.1" "huggingface-hub>=0.16.0"
 
 # Set YOLO_CONFIG_DIR so WEIGHTS_DIR resolves to /work/weights
 ENV YOLO_CONFIG_DIR=/work
@@ -324,7 +331,9 @@ WORKDIR /work
 COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
+COPY perception/edgeface_src/ /work/edgeface_src/
 COPY perception/config.yaml /work/config.yaml
+COPY perception/config/    /work/config/
 COPY perception/deploy/    /deploy/
 
 EXPOSE 15720
@@ -351,6 +360,12 @@ ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 # One write per log line instead of 8 KB block flushes that can tear a Docker
 # log record mid-write.
 ENV PYTHONUNBUFFERED=1
+# FastDDS large message profile: UDPv4 with 8 MB send/receive buffers so
+# compressed JPEG frames (which can exceed the default 65 KB SHM/UDP limit)
+# transport without fragmentation errors. The XML is copied above into
+# /work/config/. service.yml sets this same var and clears
+# FASTDDS_BUILTIN_TRANSPORTS so the XML profile is the authority.
+ENV FASTRTPS_DEFAULT_PROFILES_FILE=/work/config/fastdds_large_message.xml
 # ANSI colour codes are control bytes; in a non-tty container log they are
 # exactly the "garbage characters" that make `docker logs` unreadable.
 ENV RCUTILS_COLORIZED_OUTPUT=0

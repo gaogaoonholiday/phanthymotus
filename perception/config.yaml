@@ -82,3 +82,16 @@ plugins:
       det_thresh: 0.1
       det_box_thresh: 0.1
     min_interval_ms: 0
+
+  face:
+    enabled: true
+    provider: local
+    url: ""
+    key: ""
+    model: edgeface_s_gamma_05   # 3.65M params, ~14MB — fits <30M constraint
+    device: cuda
+    model_dir: /models/face
+    face_db_dir: /workspace/face_db
+    similarity_threshold: 0.5
+    confidence: 0.7
+    fps: 5
