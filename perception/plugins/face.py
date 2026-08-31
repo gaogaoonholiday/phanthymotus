@@ -530,10 +530,11 @@ class FaceRecognitionPlugin:
         self._confidence = float(plugin_cfg.get("confidence", 0.7))
         self._fps = int(plugin_cfg.get("fps", 5))
 
-        self._model = None  # lazy load
+        self._model = None
         self._model_loading = False
         self._model_load_error = None
         self._model_lock = threading.Lock()
+        self._pending_starts: list[tuple[str, str]] = []
 
         self._face_db = FaceDatabase()
         self._nodes: dict[str, _FaceNode] = {}
@@ -541,6 +542,33 @@ class FaceRecognitionPlugin:
 
         log.info(f"[face] plugin init: model={self._model_name}, device={self._device}, "
                  f"face_db_dir={self._face_db_dir}")
+
+        # Pre-load model at startup so it's ready before evaluation calls start.
+        # The benchmark calls start then immediately publishes images; if the model
+        # is still loading the ROS2 subscriber doesn't exist yet and frames are lost.
+        self._start_model_loading()
+
+    def _start_model_loading(self):
+        """Start loading model in background. Processes pending starts when done."""
+        if self._model_loading or self._model is not None:
+            return
+        self._model_loading = True
+
+        def _bg_load():
+            try:
+                self._ensure_model()
+                self._model_loading = False
+                log.info("[face] model loaded, processing pending starts")
+                for node_key, input_topic in self._pending_starts:
+                    if node_key not in self._nodes:
+                        self._start_node(node_key, input_topic)
+                self._pending_starts.clear()
+            except Exception as e:
+                self._model_loading = False
+                self._model_load_error = str(e)
+                log.error(f"[face] model load failed: {e}", exc_info=True)
+
+        threading.Thread(target=_bg_load, daemon=True, name="face_model_load").start()
 
     def _ensure_model(self):
         """Load model and identity library in background."""
@@ -636,22 +664,15 @@ class FaceRecognitionPlugin:
             if node_key not in self._nodes:
                 if self._model is None:
                     if self._model_loading:
-                        return {"state": "loading", "message": "Model is still loading, please wait..."}
+                        # Queue this start; it will be processed when model finishes loading
+                        self._pending_starts.append((node_key, input_topic))
+                        return {"state": "loading", "input": input_topic, "output": f"{input_topic}/face",
+                                "message": "Model is loading, node will start automatically when ready"}
                     if self._model_load_error:
                         return {"state": "error", "message": f"Model failed to load: {self._model_load_error}"}
-                    # Model not loaded yet — start loading in background
-                    def _bg_start():
-                        self._model_loading = True
-                        self._model_load_error = None
-                        try:
-                            self._ensure_model()
-                            self._model_loading = False
-                            self._start_node(node_key, input_topic)
-                        except Exception as e:
-                            self._model_loading = False
-                            self._model_load_error = str(e)
-                            log.error(f"[face] model load failed: {e}", exc_info=True)
-                    threading.Thread(target=_bg_start, daemon=True, name="face_model_load").start()
+                    # Should not reach here since __init__ starts loading, but handle it
+                    self._pending_starts.append((node_key, input_topic))
+                    self._start_model_loading()
                     return {"state": "loading", "input": input_topic, "output": f"{input_topic}/face",
                             "message": "Model loading in background, will start automatically"}
                 self._start_node(node_key, input_topic)
