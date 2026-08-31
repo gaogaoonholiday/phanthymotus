@@ -2,7 +2,7 @@ mcp_port: 15720
 
 plugins:
   asr:
-    enabled: true
+    enabled: false
     # Matches the configSchema default. SenseVoice on CPU is also the faster of
     # the two int8 options (RTF 14.2x vs 9.1x for streaming paraformer) and has
     # the largest gpu upside (fp16).
@@ -38,7 +38,7 @@ plugins:
         - "x iǎo f àn x iǎo f àn @小范小范"
 
   tts:
-    enabled: true
+    enabled: false
     engine: vits2_trt
     backend: trt
     model_dir: /models/vits2
@@ -52,7 +52,7 @@ plugins:
     device: cpu
 
   vop:
-    enabled: true
+    enabled: false
     namespace: ""       # auto-detect from hostname if empty
     model: "yolov8s-worldv2"
     confidence: 0.3
@@ -60,7 +60,7 @@ plugins:
     fps: 5
 
   ocr:
-    enabled: true
+    enabled: false
     provider: rapidocr
     model_dir: /models/ocr/ppocrv6-small-trt
     device_id: 0
