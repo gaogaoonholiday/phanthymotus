@@ -35,10 +35,10 @@ class MTCNN():
         self.onet.eval()
         self.refrence = get_reference_facial_points(default_square=crop_size[0] == crop_size[1])
 
-        self.min_face_size = 40
+        self.min_face_size = 20
         self.thresholds =  [0.6,0.7,0.9]
         self.nms_thresholds = [0.7, 0.7, 0.7]
-        self.factor = 0.709
+        self.factor = 0.85
 
 
         os.chdir(cwd)

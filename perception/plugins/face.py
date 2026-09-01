@@ -147,7 +147,7 @@ TOOLS = [
                     "type": "string",
                     "enum": ["cuda", "cpu"],
                     "description": "Inference device",
-                    "default": "cpu",
+                    "default": "cuda",
                     "scope": "shared",
                 },
             },
@@ -283,18 +283,13 @@ class EdgeFaceAdapter:
     Model weights are auto-downloaded from juicefs.
     """
 
-    def __init__(self, model_name: str, model_dir: str, device: str = "cpu"):
+    def __init__(self, model_name: str, model_dir: str, device: str = "cuda"):
         import torch
         from torchvision import transforms
 
         self._device = torch.device(
             device if device == "cuda" and torch.cuda.is_available() else "cpu"
         )
-
-        # Limit threads: 10 concurrent containers on the same Jetson CPU would
-        # oversubscribe badly. 1 thread per container is optimal for throughput.
-        if self._device.type == "cpu":
-            torch.set_num_threads(1)
 
         # Download weights from juicefs
         ckpt_path = _ensure_weights(model_name, model_dir)
@@ -531,7 +526,7 @@ class FaceRecognitionPlugin:
     def __init__(self, plugin_cfg: dict, executor):
         self._executor = executor
         self._model_name = plugin_cfg.get("model", DEFAULT_MODEL_NAME)
-        self._device = plugin_cfg.get("device", "cpu")
+        self._device = plugin_cfg.get("device", "cuda")
         self._face_db_dir = plugin_cfg.get("face_db_dir") or os.getenv("FACE_DB_DIR", "/workspace/face_db")
         self._model_dir = plugin_cfg.get("model_dir", "/models/face")
         self._similarity_threshold = float(plugin_cfg.get("similarity_threshold", DEFAULT_SIMILARITY_THRESHOLD))
