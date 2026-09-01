@@ -45,6 +45,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
+from utils.ros_lifecycle import dispose_node
+
 log = logging.getLogger(__name__)
 
 # ── EdgeFace source on path ──────────────────────────────────────────────────
@@ -75,7 +77,7 @@ _LOW_LAT_QOS = QoSProfile(
 _PUB_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
     history=HistoryPolicy.KEEP_LAST,
-    depth=10,
+    depth=1,
     durability=DurabilityPolicy.VOLATILE,
 )
 
@@ -145,7 +147,7 @@ TOOLS = [
                     "type": "string",
                     "enum": ["cuda", "cpu"],
                     "description": "Inference device",
-                    "default": "cuda",
+                    "default": "cpu",
                     "scope": "shared",
                 },
             },
@@ -492,6 +494,7 @@ class _FaceNode(Node):
                         "detect_confidence": round(det["confidence"], 4),
                         "bbox_relative": bbox_relative,
                         "identity": {
+                            "status": "known" if person_id != "unknown" else "unknown",
                             "person_id": person_id,
                             "confidence": round(similarity, 4),
                         }
@@ -523,7 +526,7 @@ class FaceRecognitionPlugin:
     def __init__(self, plugin_cfg: dict, executor):
         self._executor = executor
         self._model_name = plugin_cfg.get("model", DEFAULT_MODEL_NAME)
-        self._device = plugin_cfg.get("device", "cuda")
+        self._device = plugin_cfg.get("device", "cpu")
         self._face_db_dir = plugin_cfg.get("face_db_dir") or os.getenv("FACE_DB_DIR", "/workspace/face_db")
         self._model_dir = plugin_cfg.get("model_dir", "/models/face")
         self._similarity_threshold = float(plugin_cfg.get("similarity_threshold", DEFAULT_SIMILARITY_THRESHOLD))
@@ -682,7 +685,7 @@ class FaceRecognitionPlugin:
             if instance_id and instance_id in self._nodes:
                 node = self._nodes[instance_id]
                 result = node.stop()
-                self._executor.remove_node(node)
+                dispose_node(self._executor, node, label=f"face/{instance_id}")
                 del self._nodes[instance_id]
                 return result
             elif not instance_id and self._nodes:
@@ -690,7 +693,7 @@ class FaceRecognitionPlugin:
                 for key in list(self._nodes.keys()):
                     node = self._nodes[key]
                     node.stop()
-                    self._executor.remove_node(node)
+                    dispose_node(self._executor, node, label=f"face/{key}")
                     del self._nodes[key]
                     results.append(key)
                 return {"state": "idle", "stopped_instances": results}
@@ -704,7 +707,7 @@ class FaceRecognitionPlugin:
                     node = self._nodes[instance_id]
                     input_topic = node._input_topic
                     node.stop()
-                    self._executor.remove_node(node)
+                    dispose_node(self._executor, node, label=f"face/{instance_id}")
                     del self._nodes[instance_id]
                 return {"status": "configured", "instance_id": instance_id, "config": cfg}
             else:
