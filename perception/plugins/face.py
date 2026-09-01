@@ -147,7 +147,7 @@ TOOLS = [
                     "type": "string",
                     "enum": ["cuda", "cpu"],
                     "description": "Inference device",
-                    "default": "cpu",
+                    "default": "cuda",
                     "scope": "shared",
                 },
             },
@@ -526,7 +526,7 @@ class FaceRecognitionPlugin:
     def __init__(self, plugin_cfg: dict, executor):
         self._executor = executor
         self._model_name = plugin_cfg.get("model", DEFAULT_MODEL_NAME)
-        self._device = plugin_cfg.get("device", "cpu")
+        self._device = plugin_cfg.get("device", "cuda")
         self._face_db_dir = plugin_cfg.get("face_db_dir") or os.getenv("FACE_DB_DIR", "/workspace/face_db")
         self._model_dir = plugin_cfg.get("model_dir", "/models/face")
         self._similarity_threshold = float(plugin_cfg.get("similarity_threshold", DEFAULT_SIMILARITY_THRESHOLD))

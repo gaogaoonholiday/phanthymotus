@@ -89,9 +89,9 @@ plugins:
     url: ""
     key: ""
     model: edgeface_s_gamma_05   # 3.65M params, ~14MB — fits <30M constraint
-    device: cpu                 # cpu avoids ~1.4GB CUDA context per container; 10 concurrent
-                                # containers × cuda = OOM on 8GB Jetson. EdgeFace is only 3.65M
-                                # params, CPU inference is fast enough at fps=5.
+    device: cuda                 # MTCNN 3-stage cascade + image pyramid is too slow on CPU
+                                # (23-47s/case vs 120s timeout). EdgeFace is only 3.65M params,
+                                # GPU memory overhead is minimal. OOM was from node leak, now fixed.
     model_dir: /models/face
     face_db_dir: /workspace/face_db
     similarity_threshold: 0.5
