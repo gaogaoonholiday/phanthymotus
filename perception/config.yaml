@@ -89,11 +89,11 @@ plugins:
     url: ""
     key: ""
     model: edgeface_s_gamma_05   # 3.65M params, ~14MB — fits <30M constraint
-    device: cuda                 # MTCNN 3-stage cascade + image pyramid is too slow on CPU
-                                # (23-47s/case vs 120s timeout). EdgeFace is only 3.65M params,
-                                # GPU memory overhead is minimal. OOM was from node leak, now fixed.
+    device: cuda                 # EdgeFace on GPU (14MB CUDA ctx on Jetson unified memory)
+                                # YuNet detector runs on CPU (~200ms at 1280px)
+                                # Total ~350ms/frame, ~2.9 fps, ~727MB RSS per container
     model_dir: /models/face
     face_db_dir: /workspace/face_db
     similarity_threshold: 0.5
-    confidence: 0.7
-    fps: 5
+    confidence: 0.5
+    fps: 3

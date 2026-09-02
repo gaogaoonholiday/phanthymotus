@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-plugins/face.py — FaceRecognitionPlugin: EdgeFace + MTCNN face recognition.
+plugins/face.py — FaceRecognitionPlugin: EdgeFace + YuNet face recognition.
 
-Pipeline: CompressedImage → MTCNN detect → align (112×112) → EdgeFace embed → identity match
+Pipeline: CompressedImage → YuNet detect → align (112×112) → EdgeFace embed → identity match
 Downloads weights from juicefs (http://172.28.4.81:34567/).
 Outputs benchmark-compliant JSON:
   {
@@ -88,7 +88,7 @@ TOOLS = [
         "name": "face",
         "type": "processor",
         "multiInstance": True,
-        "description": "Face Recognition — detect and identify faces using EdgeFace + MTCNN",
+        "description": "Face Recognition — detect and identify faces using EdgeFace + YuNet",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -133,14 +133,14 @@ TOOLS = [
                 },
                 "confidence": {
                     "type": "number",
-                    "description": "MTCNN detection confidence threshold (0-1)",
-                    "default": 0.7,
+                    "description": "YuNet detection confidence threshold (0-1)",
+                    "default": 0.5,
                     "scope": "instance",
                 },
                 "fps": {
                     "type": "integer",
                     "description": "Max inference frames per second",
-                    "default": 5,
+                    "default": 3,
                     "scope": "instance",
                 },
                 "device": {
@@ -173,19 +173,14 @@ def _ensure_weights(model_name: str, model_dir: str) -> str:
         urllib.request.urlretrieve(url, ckpt_path)
         log.info(f"[face] download complete: {ckpt_path} ({os.path.getsize(ckpt_path) / 1e6:.1f} MB)")
 
-    # MTCNN weights — go into edgeface_src tree where get_nets.py expects them
-    mtcnn_weights_dir = os.path.join(
-        _EDGEFACE_SRC, "face_alignment", "mtcnn_pytorch", "src", "weights"
-    )
-    os.makedirs(mtcnn_weights_dir, exist_ok=True)
-
-    for npy_name in ["pnet.npy", "rnet.npy", "onet.npy"]:
-        npy_path = os.path.join(mtcnn_weights_dir, npy_name)
-        if not os.path.exists(npy_path):
-            url = f"{_MODEL_BASE_URL}/mtcnn/{npy_name}"
-            log.info(f"[face] downloading {npy_name} from {url}")
-            urllib.request.urlretrieve(url, npy_path)
-            log.info(f"[face] download complete: {npy_path}")
+    # YuNet ONNX model
+    yunet_filename = "face_detection_yunet_2023mar.onnx"
+    yunet_path = os.path.join(model_dir, yunet_filename)
+    if not os.path.exists(yunet_path):
+        url = f"{_MODEL_BASE_URL}/{yunet_filename}"
+        log.info(f"[face] downloading {yunet_filename} from {url}")
+        urllib.request.urlretrieve(url, yunet_path)
+        log.info(f"[face] download complete: {yunet_path} ({os.path.getsize(yunet_path) / 1e6:.1f} MB)")
 
     return ckpt_path
 
@@ -274,22 +269,35 @@ class FaceDatabase:
             return sum(len(v) for v in self._embeddings.values())
 
 
-# ── EdgeFace + MTCNN Adapter ──────────────────────────────────────────────────
+# ── EdgeFace + YuNet Adapter ──────────────────────────────────────────────────
+
+# ArcFace 5-point reference for 112×112 alignment
+_ARCFACE_REF = np.array([
+    [38.2946, 51.6963], [73.5318, 51.6963], [56.0252, 71.7366],
+    [41.5493, 92.3655], [70.7299, 92.3655],
+], dtype=np.float32)
+
+# Resize input to this width for detection (speed/accuracy trade-off)
+_DETECT_TARGET_W = 1280
+
 
 class EdgeFaceAdapter:
-    """MTCNN face detection + EdgeFace embedding extraction.
+    """YuNet face detection + EdgeFace embedding extraction.
 
-    Uses EdgeFace backbone (timm-based) and MTCNN face detector from edgeface_src/.
+    YuNet (OpenCV FaceDetectorYN) is a single-stage detector — no image pyramid,
+    ~5-15ms on CPU for 1280px. EdgeFace runs on GPU for fast embedding.
     Model weights are auto-downloaded from juicefs.
     """
 
-    def __init__(self, model_name: str, model_dir: str, device: str = "cuda"):
+    def __init__(self, model_name: str, model_dir: str, device: str = "cuda",
+                 confidence: float = 0.5):
         import torch
         from torchvision import transforms
 
         self._device = torch.device(
             device if device == "cuda" and torch.cuda.is_available() else "cpu"
         )
+        torch.set_num_threads(1)
 
         # Download weights from juicefs
         ckpt_path = _ensure_weights(model_name, model_dir)
@@ -304,16 +312,17 @@ class EdgeFaceAdapter:
         self._model.to(self._device).eval()
         log.info(f"[face] EdgeFace loaded: {model_name}, device={self._device}")
 
-        # ── MTCNN detector ──
-        from face_alignment import mtcnn
-
-        # MTCNN asserts device in ['cuda:0', 'cpu']
-        mtcnn_device = "cuda:0" if self._device.type == "cuda" else "cpu"
-        self._mtcnn = mtcnn.MTCNN(
-            device=mtcnn_device,
-            crop_size=(112, 112),
+        # ── YuNet detector (OpenCV ONNX) ──
+        import cv2
+        yunet_path = os.path.join(model_dir, "face_detection_yunet_2023mar.onnx")
+        self._detector = cv2.FaceDetectorYN_create(
+            yunet_path, "", (320, 320),
+            score_threshold=confidence,
+            nms_threshold=0.3,
+            top_k=5000,
         )
-        log.info(f"[face] MTCNN loaded, device={self._device}")
+        self._confidence = confidence
+        log.info(f"[face] YuNet loaded, conf={confidence}")
 
         # ── Preprocessing transform (same as training) ──
         self._transform = transforms.Compose([
@@ -330,54 +339,63 @@ class EdgeFaceAdapter:
         Returns:
             List of dicts with keys:
               - embedding: np.ndarray (512-dim)
-              - bbox: [x1, y1, x2, y2] in pixel coords
+              - bbox: [x1, y1, x2, y2] in pixel coords (original resolution)
               - confidence: float
         """
+        import cv2
         import torch
         from PIL import Image
 
-        if isinstance(image, np.ndarray):
-            pil_image = Image.fromarray(image)
+        H_orig, W_orig = image.shape[:2]
+
+        # ── Resize for detection (speed) ──
+        if W_orig > _DETECT_TARGET_W:
+            scale = _DETECT_TARGET_W / W_orig
+            new_h, new_w = int(H_orig * scale), _DETECT_TARGET_W
+            img_det = cv2.resize(image, (new_w, new_h))
         else:
-            pil_image = image
+            scale = 1.0
+            new_h, new_w = H_orig, W_orig
+            img_det = image
 
-        # ── MTCNN detection + alignment ──
-        boxes, landmarks = self._mtcnn.detect_faces(
-            pil_image,
-            self._mtcnn.min_face_size,
-            self._mtcnn.thresholds,
-            self._mtcnn.nms_thresholds,
-            self._mtcnn.factor,
-        )
+        # YuNet expects (W, H) for setInputSize
+        self._detector.setInputSize((new_w, new_h))
+        _, faces = self._detector.detect(img_det)
 
-        if len(boxes) == 0:
+        if faces is None:
             return []
 
-        from face_alignment.mtcnn_pytorch.src.align_trans import (
-            get_reference_facial_points, warp_and_crop_face,
-        )
-        reference = get_reference_facial_points(default_square=True)
-
         results = []
-        for box, lm in zip(boxes, landmarks):
-            facial5points = [[lm[j], lm[j + 5]] for j in range(5)]
+        for f in faces:
+            if f[14] < self._confidence:
+                continue
 
-            # Warp and crop face to 112×112
-            warped_face = warp_and_crop_face(
-                np.array(pil_image), facial5points, reference, crop_size=(112, 112),
-            )
-            aligned = Image.fromarray(warped_face)
+            # 5 landmarks: right_eye, left_eye, nose, right_mouth, left_mouth
+            landmarks = np.array([
+                [f[4], f[5]], [f[6], f[7]], [f[8], f[9]],
+                [f[10], f[11]], [f[12], f[13]],
+            ], dtype=np.float32)
 
-            # ── EdgeFace embedding extraction ──
-            transformed = self._transform(aligned).unsqueeze(0).to(self._device)
+            # Affine align to 112×112
+            M = cv2.estimateAffinePartial2D(landmarks, _ARCFACE_REF)[0]
+            if M is None:
+                continue
+            aligned = cv2.warpAffine(img_det, M, (112, 112), borderValue=0)
+
+            # EdgeFace embedding
+            tensor = self._transform(Image.fromarray(aligned)).unsqueeze(0).to(self._device)
             with torch.no_grad():
-                embedding = self._model(transformed)
+                embedding = self._model(tensor)
             embedding = embedding.cpu().numpy().flatten()
+
+            # Scale bbox back to original resolution
+            x, y, w, h = float(f[0]), float(f[1]), float(f[2]), float(f[3])
+            bbox = [x / scale, y / scale, (x + w) / scale, (y + h) / scale]
 
             results.append({
                 "embedding": embedding,
-                "bbox": [float(box[0]), float(box[1]), float(box[2]), float(box[3])],
-                "confidence": float(box[4]) if len(box) > 4 else 1.0,
+                "bbox": bbox,
+                "confidence": float(f[14]),
             })
 
         return results
@@ -582,7 +600,8 @@ class FaceRecognitionPlugin:
                 return
 
             self._model = EdgeFaceAdapter(
-                self._model_name, self._model_dir, self._device
+                self._model_name, self._model_dir, self._device,
+                confidence=self._confidence,
             )
 
             # Load identity library
@@ -652,7 +671,7 @@ class FaceRecognitionPlugin:
                 "instances": instances,
                 "topic_in": topics_in,
                 "topic_out": topics_out,
-                "desc": "EdgeFace + MTCNN face recognition",
+                "desc": "EdgeFace + YuNet face recognition",
             }
 
         elif action == "start":
