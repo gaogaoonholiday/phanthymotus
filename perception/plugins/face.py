@@ -4,21 +4,17 @@ plugins/face.py — FaceRecognitionPlugin: EdgeFace + YuNet face recognition.
 
 Pipeline: CompressedImage → YuNet detect → align (112×112) → EdgeFace embed → identity match
 Downloads weights from juicefs (http://172.28.4.81:34567/).
-Outputs benchmark-compliant JSON:
-  {
-    "image_size": {"width": W, "height": H},
-    "faces": [
-      {
-        "detect_confidence": 0.95,
-        "bbox_relative": [x1, y1, x2, y2],  # normalized [0-1]
-        "identity": {
-          "status": "known" | "unknown",
-          "person_id": "n000001",
-          "confidence": 0.91
-        }
+Outputs benchmark-compliant JSON (faces array only, no wrapper):
+  [
+    {
+      "detect_confidence": 0.95,
+      "bbox_relative": [x1, y1, x2, y2],  # normalized [0-1]
+      "identity": {
+        "person_id": "n000001",
+        "confidence": 0.91
       }
-    ]
-  }
+    }
+  ]
 
 Supports multi-instance (one instance per input topic).
 Follows VOP plugin architecture: CompressedImage subscription, frame queue,
@@ -50,7 +46,6 @@ from utils.ros_lifecycle import dispose_node
 log = logging.getLogger(__name__)
 
 # ── EdgeFace source on path ──────────────────────────────────────────────────
-# edgeface_src/ (backbones, face_alignment) lives alongside perception/ in repo.
 _EDGEFACE_SRC = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "edgeface_src",
@@ -147,7 +142,7 @@ TOOLS = [
                     "type": "string",
                     "enum": ["cuda", "cpu"],
                     "description": "Inference device",
-                    "default": "cuda",
+                    "default": "cpu",
                     "scope": "shared",
                 },
             },
@@ -285,11 +280,14 @@ class EdgeFaceAdapter:
     """YuNet face detection + EdgeFace embedding extraction.
 
     YuNet (OpenCV FaceDetectorYN) is a single-stage detector — no image pyramid,
-    ~5-15ms on CPU for 1280px. EdgeFace runs on GPU for fast embedding.
+    ~250ms on CPU for 1280px. EdgeFace runs on CPU (~189ms) or GPU (~26ms).
     Model weights are auto-downloaded from juicefs.
+
+    device='cpu':  ~440ms/frame, ~2.3 fps, no CUDA context — safe for 10 containers
+    device='cuda': ~335ms/frame, ~3.0 fps, but 10 containers may OOM on 16GB Orin
     """
 
-    def __init__(self, model_name: str, model_dir: str, device: str = "cuda",
+    def __init__(self, model_name: str, model_dir: str, device: str = "cpu",
                  confidence: float = 0.5):
         import torch
         from torchvision import transforms
@@ -489,7 +487,7 @@ class _FaceNode(Node):
                 # ── Detect + embed ──
                 detections = self._model.detect_and_embed(rgb_frame)
 
-                # ── Build benchmark-compliant output ──
+                # ── Build benchmark-compliant output (faces array only) ──
                 faces = []
                 for det in detections:
                     x1, y1, x2, y2 = det["bbox"]
@@ -512,19 +510,13 @@ class _FaceNode(Node):
                         "detect_confidence": round(det["confidence"], 4),
                         "bbox_relative": bbox_relative,
                         "identity": {
-                            "status": "known" if person_id != "unknown" else "unknown",
                             "person_id": person_id,
                             "confidence": round(similarity, 4),
                         }
                     })
 
-                result = {
-                    "image_size": {"width": W, "height": H},
-                    "faces": faces,
-                }
-
                 msg = String()
-                msg.data = json.dumps(result, ensure_ascii=False)
+                msg.data = json.dumps(faces, ensure_ascii=False)
                 self._pub.publish(msg)
 
                 self._detect_count += 1
@@ -544,12 +536,12 @@ class FaceRecognitionPlugin:
     def __init__(self, plugin_cfg: dict, executor):
         self._executor = executor
         self._model_name = plugin_cfg.get("model", DEFAULT_MODEL_NAME)
-        self._device = plugin_cfg.get("device", "cuda")
+        self._device = plugin_cfg.get("device", "cpu")
         self._face_db_dir = plugin_cfg.get("face_db_dir") or os.getenv("FACE_DB_DIR", "/workspace/face_db")
         self._model_dir = plugin_cfg.get("model_dir", "/models/face")
         self._similarity_threshold = float(plugin_cfg.get("similarity_threshold", DEFAULT_SIMILARITY_THRESHOLD))
-        self._confidence = float(plugin_cfg.get("confidence", 0.7))
-        self._fps = int(plugin_cfg.get("fps", 5))
+        self._confidence = float(plugin_cfg.get("confidence", 0.5))
+        self._fps = int(plugin_cfg.get("fps", 3))
 
         self._model = None
         self._model_loading = False
