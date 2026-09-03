@@ -89,10 +89,9 @@ plugins:
     url: ""
     key: ""
     model: edgeface_s_gamma_05   # 3.65M params, ~14MB — fits <30M constraint
-    device: cpu                 # YuNet detector ~250ms on CPU, EdgeFace ~189ms on CPU
-                                # Total ~440ms/frame, ~2.3 fps — under 3 fps limit
-                                # CPU mode avoids CUDA context overhead for 10 containers
-    inference_backend: pytorch   # pytorch | onnx — onnx is 2-3x faster on CPU
+    device: cpu                 # YuNet + EdgeFace both on CPU — zero GPU for 10 containers
+    inference_backend: onnx      # ONNX Runtime: 27ms/embed vs 1407ms PyTorch (1 thread)
+                                # Total ~277ms/frame, 3.6 fps — meets 3 fps limit
     detector: yunet              # yunet | mtcnn — mtcnn runs on GPU, more accurate landmarks
     model_dir: /models/face
     face_db_dir: /workspace/face_db
