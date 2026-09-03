@@ -165,12 +165,17 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --no-deps "git+https://ghfast.
 RUN mkdir -p /work/weights/clip && \
     python3 -c "import urllib.request; urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/ViT-B-32.pt', '/work/weights/clip/ViT-B-32.pt')"
 
-# ── Face recognition deps (EdgeFace + MTCNN) ────────────────────
+# ── Face recognition deps (EdgeFace + YuNet + ONNX Runtime) ─────────
 # EdgeFace backbone (edgenext_small) is created via timm.create_model(); torch,
 # torchvision, Pillow and cv2 are already in the base image / VOP layer. timm is
 # installed --no-deps so it does not pull a different torch/torchvision wheel.
+# onnxruntime: EdgeFace ONNX inference (52x faster than PyTorch on CPU).
+# sherpa-onnx bundles its own onnxruntime .so internally; the standalone
+# onnxruntime Python module is needed for face.py's ONNX Runtime session.
 RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} timm && \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} "safetensors>=0.3.1" "huggingface-hub>=0.16.0"
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} "safetensors>=0.3.1" "huggingface-hub>=0.16.0" && \
+    { python3 -c "import onnxruntime" 2>/dev/null || \
+      pip3 install --no-cache-dir -i ${PYPI_MIRROR} onnxruntime; }
 
 # Set YOLO_CONFIG_DIR so WEIGHTS_DIR resolves to /work/weights
 ENV YOLO_CONFIG_DIR=/work

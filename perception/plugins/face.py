@@ -390,7 +390,12 @@ class EdgeFaceAdapter:
         )
 
         if inference_backend == "onnx":
-            self._init_onnx(model_name, model_dir)
+            try:
+                self._init_onnx(model_name, model_dir)
+            except Exception as e:
+                log.warning(f"[face] ONNX init failed ({e}), falling back to PyTorch")
+                self._inference_backend = "pytorch"
+                self._init_pytorch(model_name, ckpt_path)
         else:
             self._init_pytorch(model_name, ckpt_path)
 
