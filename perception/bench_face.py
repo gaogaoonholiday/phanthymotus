@@ -16,7 +16,7 @@ os.environ["PYTHONWARNINGS"] = "ignore"
 
 # ── Path setup ──
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-EDGEFACE_SRC = os.path.join(SCRIPT_DIR, "phanthymotus-face", "perception", "edgeface_src")
+EDGEFACE_SRC = os.path.join(SCRIPT_DIR, "edgeface_src")
 sys.path.insert(0, EDGEFACE_SRC)
 
 # ── Suppress numpy warnings ──
