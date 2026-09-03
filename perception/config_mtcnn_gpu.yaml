@@ -1,0 +1,89 @@
+# Config variant: MTCNN + EdgeFace on GPU
+# Use this config to test MTCNN detector + EdgeFace embedding on GPU.
+# MTCNN provides more accurate landmarks than YuNet, improving alignment quality.
+# Both detector and embedder run on GPU.
+#
+# VRAM concern: 10 containers × CUDA context (~1.4GB each) = 14GB on 16GB Orin.
+# This may OOM. If it does, fall back to config.yaml (YuNet + EdgeFace CPU).
+#
+# Usage:
+#   cp config_mtcnn_gpu.yaml config.yaml
+
+mcp_port: 15720
+
+plugins:
+  asr:
+    enabled: false
+    asr_model: sensevoice-small
+    device: cpu
+    num_threads: 2
+    warmup: true
+    language: zh-CN
+    vad:
+      model: sherpa_onnx
+      threshold: 0.5
+      silence_ms: 400
+      pre_roll_ms: 500
+    kws:
+      enabled: true
+      model_dir: /models/sherpa-onnx/kws
+      keywords:
+        - "x iǎo f àn x iǎo f àn @小范小范"
+
+  tts:
+    enabled: false
+    engine: vits2_trt
+    backend: trt
+    model_dir: /models/vits2
+    speaker_id: 0
+    speed: 1.0
+    warmup: true
+    max_chunk_tokens: 256
+    device: cpu
+
+  vop:
+    enabled: false
+    namespace: ""
+    model: "yolov8s-worldv2"
+    confidence: 0.3
+    classes: []
+    fps: 5
+
+  ocr:
+    enabled: false
+    provider: rapidocr
+    model_dir: /models/ocr/ppocrv6-small-trt
+    device_id: 0
+    language: zh
+    use_angle_cls: true
+    max_side_len: 1600
+    det_unclip_ratio: 0.7
+    det_thresh: 0.3
+    det_box_thresh: 0.5
+    rec_min_score: 0.9
+    crop_refinement:
+      enabled: true
+      min_score: 0.9
+      min_gain: 0.12
+      min_text_length: 2
+      profiles: [prefix_65, upper_center, upper_tight]
+    empty_result_retry:
+      enabled: true
+      det_thresh: 0.1
+      det_box_thresh: 0.1
+    min_interval_ms: 0
+
+  face:
+    enabled: true
+    provider: local
+    url: ""
+    key: ""
+    model: edgeface_s_gamma_05
+    device: cuda                # GPU mode — MTCNN + EdgeFace both on GPU
+    inference_backend: pytorch   # pytorch backend for GPU
+    detector: mtcnn              # MTCNN detector (GPU) instead of YuNet (CPU)
+    model_dir: /models/face
+    face_db_dir: /workspace/face_db
+    similarity_threshold: 0.5
+    confidence: 0.5
+    fps: 3

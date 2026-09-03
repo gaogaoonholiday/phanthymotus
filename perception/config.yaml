@@ -92,6 +92,8 @@ plugins:
     device: cpu                 # YuNet detector ~250ms on CPU, EdgeFace ~189ms on CPU
                                 # Total ~440ms/frame, ~2.3 fps — under 3 fps limit
                                 # CPU mode avoids CUDA context overhead for 10 containers
+    inference_backend: pytorch   # pytorch | onnx — onnx is 2-3x faster on CPU
+    detector: yunet              # yunet | mtcnn — mtcnn runs on GPU, more accurate landmarks
     model_dir: /models/face
     face_db_dir: /workspace/face_db
     similarity_threshold: 0.5
