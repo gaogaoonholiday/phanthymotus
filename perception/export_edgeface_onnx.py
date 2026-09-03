@@ -18,10 +18,7 @@ CPU 上比 PyTorch 快 2-3x (189ms → 60-80ms per embedding)。
 
 import sys, os
 
-EDGEFACE_SRC = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "edgeface_src",
-)
+EDGEFACE_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "edgeface_src")
 if EDGEFACE_SRC not in sys.path:
     sys.path.insert(0, EDGEFACE_SRC)
 
