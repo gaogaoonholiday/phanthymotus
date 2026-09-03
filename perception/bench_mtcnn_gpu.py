@@ -22,12 +22,11 @@ import numpy as np
 import torch
 from PIL import Image
 
-# Suppress the "is" vs "==" SyntaxWarning from align_trans.py
-import importlib
-import face_alignment.mtcnn_pytorch.src.align_trans  # noqa
+# face_alignment.mtcnn adds its own dir to sys.path so mtcnn_pytorch resolves
+import face_alignment.mtcnn  # noqa: F401 — sets up sys.path for sub-imports
 
 test_image_path = sys.argv[1] if len(sys.argv) > 1 else \
-    os.path.join(SCRIPT_DIR, "..", "gpt_日系校园穿搭sexiestadjusted7.jpg")
+    "/mnt/disk0/dengshiwei/projects/Embodied-Intelligence/Facial-Recognition/gpt_日系校园穿搭sexiestadjusted7.jpg"
 
 print(f"[bench] test_image: {test_image_path}")
 print(f"[bench] torch: {torch.__version__}, cuda: {torch.cuda.is_available()}")
@@ -95,7 +94,16 @@ def bench_mtcnn_edgeface_gpu():
     # ── Load EdgeFace ──
     from backbones import get_model
     model_name = "edgeface_s_gamma_05"
-    ckpt_path = os.path.join(EDGEFACE_SRC, f"{model_name}.pt")
+    # Try multiple locations for checkpoint
+    ckpt_candidates = [
+        os.path.join(EDGEFACE_SRC, f"{model_name}.pt"),
+        os.path.join("/models/face", f"{model_name}.pt"),
+        os.path.join("/mnt/data/face", f"{model_name}.pt"),
+    ]
+    ckpt_path = next((p for p in ckpt_candidates if os.path.exists(p)), None)
+    if ckpt_path is None:
+        print(f"  ERROR: checkpoint not found in any of: {ckpt_candidates}")
+        return
     model = get_model(model_name)
     state_dict = torch.load(ckpt_path, map_location="cuda")
     model.load_state_dict(state_dict)
