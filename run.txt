@@ -1,0 +1,763 @@
+================================================================================
+人脸识别插件 — Jetson 调试 & 测试操作手册
+EdgeFace (edgeface_s_gamma_05) + MTCNN + PyTorch
+================================================================================
+
+目录：
+  0. 环境信息速查
+  1. SSH 登录 Jetson
+  2. 克隆代码
+  3. 构建 Docker 镜像
+  4. 准备模型 & 身份库
+  5. 启动容器
+  6. 验证插件运行
+  7. 单张图片端到端测试（不依赖 ROS2）
+  8. ROS2 话题联调测试
+  9. 常见问题排查
+ 10. 榜单提交
+
+================================================================================
+0. 环境信息速查
+================================================================================
+
+Jetson 设备:   ssh develop@10.100.121.16  (密码: develop)
+个人目录:      /home/develop/dengshiwei/
+代码仓库:      https://github.com/gaogaoonholiday/phanthymotus
+代码分支:      feat/face-recognition
+Commit ID:     073abab
+
+模型文件 (juicefs):
+URL 前缀:  http://172.28.4.81:34567/face
+本地挂载:  /mnt/data/face  (开发机上)
+文件列表:
+    edgeface_s_gamma_05.pt          14,695,737 bytes (~14MB)
+    edgeface_s_gamma_05.onnx        1,342,191 bytes (~1.3MB)
+    face_detection_yunet_2023mar.onnx  232,589 bytes (~0.2MB)
+
+身份库结构 (face_db):
+/workspace/face_db/
+    n000001/
+    0001_01.jpg
+    n000002/
+    0002_01.jpg
+每个 personId 目录下放一张正脸 JPG
+
+输出 JSON 格式 (单个人脸对象):
+{
+    "detect_confidence": 0.9876,
+    "bbox_relative": [0.123456, 0.234567, 0.345678, 0.456789],
+    "identity": {
+        "person_id": "n000001",
+        "confidence": 0.8765
+    }
+}
+
+bbox_relative 为归一化 [0-1] 坐标，6 位小数，顺序: [x1/W, y1/H, x2/W, y2/H]
+注意: 直接返回人脸对象，不要包装在 faces 数组或 {"image_size":..., "faces":...} 中
+
+================================================================================
+1. SSH 登录 Jetson
+================================================================================
+
+ssh develop@10.100.121.16
+# 密码: develop
+
+# 创建个人目录（用邮箱前缀，例如 dengshiwei）
+mkdir -p /home/develop/dengshiwei
+cd /home/develop/dengshiwei
+
+注意:
+- 空间有限，请及时清理无用数据
+- 非邮箱前缀目录将被直接清理（无提前通知）
+- 存储只用于临时存放，无可靠性保障
+- 只用来做测试，不要进行开发工作
+- 多人共用，需协调时间轮序使用
+
+================================================================================
+2. 克隆代码
+================================================================================
+
+cd /home/develop/dengshiwei
+
+git clone -b feat/face-recognition \
+https://github.com/gaogaoonholiday/phanthymotus.git
+cd phanthymotus
+
+# 确认 commit
+git log --oneline -3
+# 应看到: 073abab feat: test MTCNN GPU face detection
+#         874c08d fix: publish face object expected by evaluator
+#         e4b4990 revert: roll back to bec23f8 (field mismatch version)
+
+# 确认关键文件存在
+ls perception/plugins/face.py
+ls perception/edgeface_src/backbones/__init__.py
+ls perception/edgeface_src/face_alignment/mtcnn.py
+ls perception/edgeface_src/face_alignment/__init__.py
+ls perception/edgeface_src/face_alignment/mtcnn_pytorch/__init__.py
+
+================================================================================
+3. 构建 Docker 镜像
+================================================================================
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  本节是完整构建流程，耗时可能较长（30-60分钟）。                        │
+│  如果只需快速验证人脸识别功能，可跳到第 7 节用单张图片测试。           │
+└──────────────────────────────────────────────────────────────────────┘
+
+cd /home/develop/dengshiwei/phanthymotus
+
+# ── 方法 A: 使用官方构建脚本 ──
+# JetPack 5.11 (默认)
+./deploy/build_perception.sh --mirror tuna
+
+# JetPack 6.1
+./deploy/build_perception.sh --jp-version 6.1 --mirror tuna
+
+# ── 方法 B: 手动 docker build ──
+docker build \
+-f perception/Dockerfile.jetson \
+--build-arg PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/ \
+--build-arg APT_MIRROR=mirrors.tuna.tsinghua.edu.cn \
+--build-arg JP_VERSION=511 \
+-t face-recognition:jp511 \
+.
+
+# ── 方法 C: 只构建人脸识别相关依赖（跳过 ASR/TTS/OCR 加速构建）──
+# 如果构建完整镜像太慢，可以用最小化 Dockerfile 快速验证
+cat > /tmp/Dockerfile.face_test << 'DOCKERFILE'
+FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
+
+ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
+ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+
+RUN if [ -n "${APT_MIRROR}" ]; then \
+        sed -i "s/archive.ubuntu.com/${APT_MIRROR}/g; s/ports.ubuntu.com/${APT_MIRROR}/g" /etc/apt/sources.list; \
+    fi && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg libvips42 espeak-ng && \
+    rm -rf /var/lib/apt/lists/*
+
+# PyYAML --ignore-installed (JP5 focal 的 distutils PyYAML 问题)
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    --ignore-installed pyyaml requests websockets websocket-client
+
+# 修复 cv2 (JP5 的 mat_wrapper 循环导入)
+RUN CV2_DIR="/usr/lib/python3.8/dist-packages/cv2"; \
+    python3 -c "import cv2" 2>/dev/null || { \
+    printf '%s\n' \
+        'import importlib.util, sys, os, glob' \
+        '_here = os.path.dirname(__file__)' \
+        '_hits = glob.glob(os.path.join(_here, "python-*", "cv2*.so")) or glob.glob(os.path.join(_here, "cv2*.so"))' \
+        '_spec = importlib.util.spec_from_file_location("cv2", _hits[0])' \
+        '_mod = importlib.util.module_from_spec(_spec)' \
+        '_spec.loader.exec_module(_mod)' \
+        'sys.modules["cv2"] = _mod' \
+        > "${CV2_DIR}/__init__.py"; \
+    }
+
+# 人脸识别依赖
+RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} timm && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+        "safetensors>=0.3.1" "huggingface-hub>=0.16.0"
+
+WORKDIR /work
+COPY perception/main.py         /work/main.py
+COPY perception/plugins/        /work/plugins/
+COPY perception/utils/          /work/utils/
+COPY perception/edgeface_src/   /work/edgeface_src/
+COPY perception/config.yaml     /work/config.yaml
+COPY perception/config/         /work/config/
+COPY perception/deploy/         /deploy/
+
+RUN PTH="/usr/local/lib/python3.8/dist-packages/ros_ws.pth"; \
+    find /ros_ws/install -name "site-packages" -type d > "${PTH}" && \
+    find /opt/ros/humble/install -name "site-packages" -type d >> "${PTH}"
+
+ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
+ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
+ENV PYTHONUNBUFFERED=1
+ENV FASTRTPS_DEFAULT_PROFILES_FILE=/work/config/fastdds_large_message.xml
+ENV RCUTILS_COLORIZED_OUTPUT=0
+ENV PHONEMIZER_ESPEAK_LIBRARY=/usr/lib/aarch64-linux-gnu/libespeak-ng.so.1
+
+CMD ["/bin/bash", "-c", \
+    "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
+    source /opt/ros/humble/install/setup.bash && \
+    source /ros_ws/install/setup.bash && \
+    python3 /work/main.py"]
+DOCKERFILE
+
+docker build \
+-f /tmp/Dockerfile.face_test \
+-t face-recognition:test \
+.
+
+# 构建完成后查看镜像大小
+docker images face-recognition
+
+================================================================================
+4. 准备模型 & 身份库
+================================================================================
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  容器启动时会自动从 juicefs 下载模型权重，所以模型准备通常不需要       │
+│  手动操作。但如果网络不通或想加速，可预先下载到挂载目录。               │
+│  身份库 (face_db) 必须手动准备。                                       │
+└──────────────────────────────────────────────────────────────────────┘
+
+# ── 4.1 模型文件（可选，容器会自动下载）──
+
+# 在 Jetson 上创建模型目录
+sudo mkdir -p /opt/embodied/models/face
+
+# 从 juicefs 下载模型（如果 Jetson 能直接访问 172.28.4.81）
+cd /opt/embodied/models/face
+sudo wget http://172.28.4.81:34567/face/edgeface_s_gamma_05.pt
+sudo wget http://172.28.4.81:34567/face/edgeface_s_gamma_05.onnx
+sudo wget http://172.28.4.81:34567/face/face_detection_yunet_2023mar.onnx
+
+# 或从开发机 scp 过去
+# scp /mnt/data/face/edgeface_s_gamma_05.pt develop@10.100.121.16:/opt/embodied/models/face/
+# scp /mnt/data/face/edgeface_s_gamma_05.onnx develop@10.100.121.16:/opt/embodied/models/face/
+# scp /mnt/data/face/face_detection_yunet_2023mar.onnx develop@10.100.121.16:/opt/embodied/models/face/
+
+# ── 4.2 身份库 (face_db) ──
+
+# 创建身份库目录
+sudo mkdir -p /workspace/face_db
+
+# 目录结构: face_db/<personId>/<image>.jpg
+# 例:
+#   /workspace/face_db/n000001/0001_01.jpg
+#   /workspace/face_db/n000002/0002_01.jpg
+
+# 放入测试人脸图片（每个 personId 目录一张正脸照）
+sudo mkdir -p /workspace/face_db/n000001
+sudo cp /path/to/test_face_1.jpg /workspace/face_db/n000001/0001_01.jpg
+
+# 如果有多个人，重复以上步骤
+# sudo mkdir -p /workspace/face_db/n000002
+# sudo cp /path/to/test_face_2.jpg /workspace/face_db/n000002/0002_01.jpg
+
+# 注意:
+#   - 图片格式: JPG/PNG/BMP/WEBP 均可
+#   - 建议正脸、清晰、光线良好
+#   - 每个目录可以放多张，取最佳检测
+#   - personId 用实际编号 (如 n000001)
+
+================================================================================
+5. 启动容器
+================================================================================
+
+cd /home/develop/dengshiwei/phanthymotus
+
+# ── 方法 A: 用 run-pr-image.sh（推荐，自动读 service.yml）──
+# 需要先构建好镜像
+./deploy/run-pr-image.sh face-recognition:test
+
+# 查看日志
+./deploy/run-pr-image.sh --logs
+
+# 进入容器
+./deploy/run-pr-image.sh --shell
+
+# 停止
+./deploy/run-pr-image.sh --down
+
+# ── 方法 B: 手动 docker run ──
+docker run -d \
+--name face-test \
+--runtime nvidia \
+--network host \
+--ipc host \
+--privileged \
+-v /dev:/dev \
+-v /opt/embodied/models:/models \
+-v /workspace/face_db:/workspace/face_db \
+-e ROS_DOMAIN_ID=42 \
+-e RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
+-e FASTRTPS_DEFAULT_PROFILES_FILE=/work/config/fastdds_large_message.xml \
+-e MCP_PORT=15720 \
+-e WS_PORT=15721 \
+face-recognition:test
+
+# 查看日志
+docker logs -f face-test
+
+# 进入容器
+docker exec -it face-test bash
+
+# 停止并删除
+docker rm -f face-test
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  关键挂载说明:                                                        │
+│    /opt/embodied/models → /models     模型权重 (edgeface + yunet)      │
+│    /workspace/face_db → /workspace/face_db   身份库                   │
+│                                                                        │
+│  --runtime nvidia 必须！否则 L4T 驱动库是空占位文件，                  │
+│  torch.cuda.is_available() 返回 False，import tensorrt 会报错。        │
+└──────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+6. 验证插件运行
+================================================================================
+
+# ── 6.1 确认容器启动成功 ──
+docker logs face-test 2>&1 | head -30
+
+# 应看到:
+#   FaceRecognitionPlugin loaded
+#   [face] plugin init: model=edgeface_s_gamma_05, device=cuda, backend=pytorch, face_db_dir=/workspace/face_db
+#   [face] EdgeFace loaded (pytorch): edgeface_s_gamma_05, device=cuda
+#   [face] MTCNN loaded, device=cuda:0, conf=0.5
+#   [face] face db loaded: N persons, M embeddings
+
+# ── 6.2 MCP 工具列表 ──
+curl -s http://localhost:15720 -X POST \
+-H "Content-Type: application/json" \
+-d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python3 -m json.tool
+
+# 应返回包含 "face" 工具的列表
+
+# ── 6.3 调用 face info（检查模型加载状态）──
+curl -s http://localhost:15720 -X POST \
+-H "Content-Type: application/json" \
+-d '{
+    "jsonrpc":"2.0","id":2,"method":"tools/call",
+    "params":{"name":"face","arguments":{"action":"info"}}
+}' | python3 -m json.tool
+
+# 首次调用可能返回 state="loading"，等几秒再调
+# 模型加载成功后应返回 state="idle" 或 state="running"
+
+# ── 6.4 检查模型加载日志 ──
+docker logs face-test 2>&1 | grep "\[face\]"
+
+# 应看到:
+#   [face] downloading edgeface_s_gamma_05.pt from http://172.28.4.81:34567/...
+#   [face] download complete: /models/face/edgeface_s_gamma_05.pt (14.7 MB)
+#   [face] EdgeFace loaded (pytorch): edgeface_s_gamma_05, device=cuda
+#   [face] MTCNN loaded, device=cuda:0, conf=0.5
+#   [face] face db loaded: N persons, M embeddings
+
+================================================================================
+7. 单张图片端到端测试（不依赖 ROS2）
+================================================================================
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  这是最快的验证方式，直接调用 Python 管道，不需要 ROS2 话题。         │
+│  如果这里通过，说明模型加载、检测、对齐、嵌入、匹配全链路正常。       │
+└──────────────────────────────────────────────────────────────────────┘
+
+# 在 Jetson 上（容器内或宿主机均可，需要 torch + cv2 + timm）
+
+docker exec -it face-test bash
+
+# 在容器内创建测试脚本
+cat > /tmp/test_face.py << 'PYEOF'
+"""
+单张图片端到端测试 — 不经过 ROS2，直接调用 EdgeFaceAdapter + FaceDatabase
+"""
+import sys, os, time, json
+
+# edgeface_src 加入 path（和 face.py 插件中的逻辑一致）
+EDGEFACE_SRC = "/work/edgeface_src"
+if EDGEFACE_SRC not in sys.path:
+    sys.path.insert(0, EDGEFACE_SRC)
+
+from plugins.face import EdgeFaceAdapter, FaceDatabase, DEFAULT_MODEL_NAME
+
+# ── 配置 ──
+MODEL_NAME  = os.environ.get("FACE_MODEL", DEFAULT_MODEL_NAME)
+MODEL_DIR   = os.environ.get("FACE_MODEL_DIR", "/models/face")
+FACE_DB_DIR = os.environ.get("FACE_DB_DIR", "/workspace/face_db")
+DEVICE      = os.environ.get("FACE_DEVICE", "cpu")
+TEST_IMAGE  = os.environ.get("TEST_IMAGE", "/workspace/face_db/n000001/0001_01.jpg")
+
+print(f"=== Face Recognition E2E Test ===")
+print(f"Model:     {MODEL_NAME}")
+print(f"Model dir: {MODEL_DIR}")
+print(f"Face DB:   {FACE_DB_DIR}")
+print(f"Device:    {DEVICE}")
+print(f"Test img:  {TEST_IMAGE}")
+
+# ── 1. 加载模型 ──
+print(f"\n[1/4] Loading EdgeFace + MTCNN...")
+t0 = time.time()
+adapter = EdgeFaceAdapter(MODEL_NAME, MODEL_DIR, DEVICE)
+t1 = time.time()
+print(f"  Model loaded in {t1-t0:.2f}s")
+
+# ── 2. 加载身份库 ──
+print(f"\n[2/4] Loading face database...")
+t0 = time.time()
+face_db = FaceDatabase()
+face_db.load_from_dir(FACE_DB_DIR, adapter)
+t1 = time.time()
+print(f"  DB loaded in {t1-t0:.2f}s ({face_db.count()} embeddings)")
+
+if face_db.is_empty():
+    print("  WARNING: face_db is empty! Matching will always return 'unknown'")
+
+# ── 3. 推理测试图片 ──
+print(f"\n[3/4] Detecting faces in {TEST_IMAGE}...")
+import cv2
+import numpy as np
+
+# 模拟容器内的流程: JPEG bytes → cv2.imdecode → RGB
+with open(TEST_IMAGE, 'rb') as f:
+    jpeg_bytes = f.read()
+
+t0 = time.time()
+frame = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
+H, W = frame.shape[:2]
+rgb_frame = frame[:, :, ::-1]  # BGR → RGB
+
+detections = adapter.detect_and_embed(rgb_frame)
+t1 = time.time()
+print(f"  Detection: {len(detections)} face(s) in {t1-t0:.3f}s")
+print(f"  Image size: {W}x{H}")
+
+# ── 4. 身份匹配 + 输出格式 ──
+print(f"\n[4/4] Identity matching...")
+faces = []
+for det in detections:
+    x1, y1, x2, y2 = det["bbox"]
+    bbox_relative = [
+        round(x1 / W, 6),
+        round(y1 / H, 6),
+        round(x2 / W, 6),
+        round(y2 / H, 6),
+    ]
+    embedding = np.array(det["embedding"], dtype=np.float32)
+    person_id, similarity = face_db.match(embedding, threshold=0.5)
+
+    face_result = {
+        "detect_confidence": round(det["confidence"], 4),
+        "bbox_relative": bbox_relative,
+        "identity": {
+            "person_id": person_id,
+            "confidence": round(similarity, 4),
+        }
+    }
+    faces.append(face_result)
+    print(f"  bbox: {bbox_relative}")
+    print(f"  detect_conf: {face_result['detect_confidence']}")
+    print(f"  person_id: {person_id}, sim: {similarity:.4f}")
+
+result = {
+    "faces": faces,
+}
+
+print(f"\n=== Result (JSON) ===")
+print(json.dumps(faces, ensure_ascii=False, indent=2))
+
+# ── FPS 测试 ──
+print(f"\n=== FPS Test (10 iterations) ===")
+times = []
+for i in range(10):
+    t0 = time.time()
+    dets = adapter.detect_and_embed(rgb_frame)
+    for d in dets:
+        face_db.match(np.array(d["embedding"], dtype=np.float32), threshold=0.5)
+    t1 = time.time()
+    times.append(t1 - t0)
+
+avg_time = sum(times[2:]) / len(times[2:])  # skip first 2 (warmup)
+fps = 1.0 / avg_time if avg_time > 0 else 0
+print(f"  Avg inference time: {avg_time*1000:.1f}ms")
+print(f"  Estimated FPS: {fps:.1f}")
+print(f"  GPU memory: ", end="")
+try:
+    import torch
+    if torch.cuda.is_available():
+        mem = torch.cuda.memory_allocated() / 1024 / 1024
+        print(f"{mem:.1f} MB")
+    else:
+        print("CUDA not available")
+except:
+    print("N/A")
+
+print(f"\n=== Test Complete ===")
+PYEOF
+
+# 运行测试
+python3 /tmp/test_face.py
+
+# 如果测试图片不在容器内，可挂载或 docker cp 进去:
+# docker cp /path/to/test.jpg face-test:/workspace/test.jpg
+# TEST_IMAGE=/workspace/test.jpg python3 /tmp/test_face.py
+
+# ── 预期输出 ──
+# [1/4] Loading EdgeFace + MTCNN...
+#   [face] downloading edgeface_s_gamma_05.pt ...     (首次，如果模型目录为空)
+#   [face] EdgeFace loaded (pytorch): edgeface_s_gamma_05
+#   [face] MTCNN loaded, device=cuda:0, conf=0.5
+#   Model loaded in X.XXs
+# [2/4] Loading face database...
+#   [face] loaded n000001/0001_01.jpg
+#   [face] face db loaded: 1 persons, 1 embeddings
+# [3/4] Detecting faces...
+#   Detection: 1 face(s) in 0.XXXs
+# [4/4] Identity matching...
+#   bbox: [0.123456, 0.234567, 0.345678, 0.456789]
+#   person_id: n000001, sim: 0.8765
+# === FPS Test ===
+#   Avg inference time: XX.Xms
+#   Estimated FPS: X.X
+
+================================================================================
+8. ROS2 话题联调测试
+================================================================================
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  榜单评测通过 ROS2 话题投递图片、接收结果。                             │
+│  本节模拟这个过程：发布 CompressedImage → 接收 JSON 结果。             │
+└──────────────────────────────────────────────────────────────────────┘
+
+# ── 8.1 启动 face 插件（订阅话题）──
+
+# 通过 MCP 调用 face start
+curl -s http://localhost:15720 -X POST \
+-H "Content-Type: application/json" \
+-d '{
+    "jsonrpc":"2.0","id":3,"method":"tools/call",
+    "params":{
+    "name":"face",
+    "arguments":{
+        "action":"start",
+        "input_topic":"/test/camera/rgb"
+    }
+    }
+}' | python3 -m json.tool
+
+# 首次调用返回 state="loading"（模型后台加载中）
+# 等待 10-20 秒后查看日志确认模型加载完成:
+docker logs face-test 2>&1 | grep "\[face\]"
+
+# 再次调用 info 确认状态
+curl -s http://localhost:15720 -X POST \
+-H "Content-Type: application/json" \
+-d '{
+    "jsonrpc":"2.0","id":4,"method":"tools/call",
+    "params":{"name":"face","arguments":{"action":"info"}}
+}' | python3 -m json.tool
+
+# 应返回 state="running"，topic_in 和 topic_out 已设置
+
+# ── 8.2 发布测试图片到 ROS2 话题 ──
+
+# 在容器内创建发布脚本
+cat > /tmp/publish_face.py << 'PYEOF'
+"""
+向 ROS2 话题发布一张测试图片 (CompressedImage)，然后监听输出话题
+"""
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import String
+import sys, time, json
+
+INPUT_TOPIC  = sys.argv[1] if len(sys.argv) > 1 else "/test/camera/rgb"
+OUTPUT_TOPIC = f"{INPUT_TOPIC}/face"
+IMAGE_PATH   = sys.argv[2] if len(sys.argv) > 2 else "/workspace/face_db/n000001/0001_01.jpg"
+
+rclpy.init()
+node = Node("face_test_pub")
+
+# 接收结果
+results = []
+qos = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=10,
+    durability=DurabilityPolicy.VOLATILE,
+)
+
+def on_result(msg: String):
+    data = json.loads(msg.data)
+    print(f"\n=== Received face recognition result ===")
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+    results.append(data)
+
+node.create_subscription(String, OUTPUT_TOPIC, on_result, qos)
+
+# 发布图片
+pub = node.create_publisher(CompressedImage, INPUT_TOPIC, qos)
+
+with open(IMAGE_PATH, 'rb') as f:
+    jpeg_data = f.read()
+
+msg = CompressedImage()
+msg.header.stamp = node.get_clock().now().to_msg()
+msg.format = "jpeg"
+msg.data = jpeg_data
+
+# 等订阅者就绪
+time.sleep(2)
+pub.publish(msg)
+print(f"Published {len(jpeg_data)} bytes to {INPUT_TOPIC}")
+print(f"Waiting for result on {OUTPUT_TOPIC}...")
+
+# 等待结果（最多 15 秒）
+start = time.time()
+while time.time() - start < 15 and not results:
+    rclpy.spin_once(node, timeout_sec=0.1)
+
+if not results:
+    print("ERROR: No result received within 15 seconds!")
+else:
+    print(f"\nSuccess! Got {len(results)} result(s).")
+
+node.destroy_node()
+rclpy.shutdown()
+PYEOF
+
+# 运行发布脚本
+python3 /tmp/publish_face.py /test/camera/rgb /workspace/face_db/n000001/0001_01.jpg
+
+# ── 8.3 停止插件 ──
+curl -s http://localhost:15720 -X POST \
+-H "Content-Type: application/json" \
+-d '{
+    "jsonrpc":"2.0","id":5,"method":"tools/call",
+    "params":{"name":"face","arguments":{"action":"stop"}}
+}' | python3 -m json.tool
+
+================================================================================
+9. 常见问题排查
+================================================================================
+
+┌─ 问题: torch.cuda.is_available() 返回 False ─────────────────────────┐
+│ 原因: 容器未使用 --runtime nvidia                                    │
+│ 解决: docker run 必须加 --runtime nvidia                             │
+│       L4T base image 的驱动库是空占位文件，只有 nvidia runtime        │
+│       才会挂载宿主机的真实驱动库。                                    │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ 问题: ImportError: No module named 'timm' ─────────────────────────┐
+│ 原因: Dockerfile 中 timm 安装失败或跳过                               │
+│ 解决: docker exec -it face-test pip3 install --no-deps timm          │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ 问题: MTCNN 权重加载失败 ────────────────────────────────────────────┐
+│ 原因: 容器中缺少 pnet.npy、rnet.npy 或 onet.npy                     │
+│ 解决: 这些权重已随仓库提交，确认 edgeface_src 目录完整复制到镜像中   │
+│       并确认 face.py 能导入 face_alignment.mtcnn                   │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ 问题: "Cannot uninstall 'PyYAML'" ──────────────────────────────────┐
+│ 原因: JP5 (focal) 的 python3-yaml 是 distutils 包，pip 无法卸载      │
+│ 解决: Dockerfile 已用 --ignore-installed 修复。                      │
+│       如手动安装: pip3 install --ignore-installed pyyaml              │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ 问题: face db loaded: 0 persons ──────────────────────────────────┐
+│ 原因: 身份库目录为空或路径不对                                       │
+│ 检查: ls -la /workspace/face_db/                                     │
+│       确保目录结构为 face_db/<personId>/<image>.jpg                  │
+│       确保容器挂载了 /workspace/face_db                              │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ 问题: 检测不到人脸 (Detection: 0 face(s)) ────────────────────────┐
+│ 排查: 1) 图片是否为正脸？                                             │
+│       2) 人脸是否太小？MTCNN min_face_size 当前为 40px               │
+│       3) 尝试降低阈值:                                               │
+│          config.yaml 中 confidence 默认 0.5，可临时降到 0.3          │
+│       4) 确认图片解码成功: cv2.imdecode 返回非 None                  │
+│       5) MTCNN GPU 单张高分辨率图片约 2 秒，需关注超时和吞吐量       │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ 问题: person_id 总是 "unknown" ────────────────────────────────────┐
+│ 排查: 1) face_db 是否为空？                                          │
+│       2) similarity_threshold 是否太高？默认 0.5，可降到 0.3 测试    │
+│       3) 身份库照片和测试照片是否为同一人？                          │
+│       4) 身份库照片是否正脸清晰？                                    │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ 问题: Docker build 时 cv2 import 失败 (mat_wrapper circular) ──────┐
+│ 原因: JP5.11 base image 的 cv2 __init__.py 有循环导入               │
+│ 解决: Dockerfile 已用 glob-based shim 修复 (见 Dockerfile.jetson)    │
+│       如手动修复，参考 Dockerfile.jetson 中的 cv2 修复段落           │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ 问题: GPU 占用或显存过高 ─────────────────────────────────────────┐
+│ 当前 MTCNN + EdgeFace 使用 CUDA；单进程约 reserved 333 MB。          │
+│ 10 个容器估算约 3.3 GB，超过约 1.6 GB 目标。                        │
+│ 排查: 1) 确认 fps 设置合理 (默认 3fps)                              │
+│       2) 用 nvidia-smi 或 tegrastats 监控 GPU/显存:                 │
+│          sudo tegrastats --interval 1000 | grep GR3D                │
+│       3) 若资源不满足，恢复 config.yaml 的 device: cpu              │
+└──────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+10. 榜单提交
+================================================================================
+
+代码已推送，仓库已设为 public，提交信息如下:
+
+env:
+  - name: PHANTHYMOTUS_COMMIT_ID
+    value: "073abab"
+  - name: PHANTHYMOTUS_REPO
+    value: "https://github.com/gaogaoonholiday/phanthymotus.git"
+  - name: JP_VERSION
+    value: "6,5"
+
+说明:
+- PHANTHYMOTUS_COMMIT_ID: 你 fork 仓库上推送的 commit hash
+- PHANTHYMOTUS_REPO: 你个人 fork 仓库的 HTTPS clone 地址
+- JP_VERSION (可选，默认 JP6 与 JP5 的机器都运行):
+    "6,5"  → JP6 和 JP5 机器都跑 (默认)
+    "6"    → 只在 JP6 机器上跑
+    "5"    → 只在 JP5 机器上跑
+
+提交后榜单会自动:
+1. 拉取你的 fork 仓库代码
+2. 构建 Docker 镜像 (基于 Dockerfile.jetson)
+3. 运行 judgeflow 评测模型指标
+4. 按以下指标评分:
+    - Identification Accuracy @ IOU>=0.5 (主要指标)
+    - FPS (监控指标)
+    - 推理失败率 (监控指标)
+
+注意:
+- 仓库必须为 public
+- 必须填个人 fork 地址，不能填 4paradigm/phanthymotus
+- commit_id 必须是你在 fork 上推送的 commit
+- 不要上传大于 1MB 的文件（模型在 juicefs 上下载）
+
+================================================================================
+附: 文件清单
+================================================================================
+
+本次提交 (commit 073abab) 修改/新增的文件:
+
+perception/plugins/face.py              修改 — 切换到 MTCNN GPU + EdgeFace:
+  1. 用 MTCNN 三阶段级联检测器替换 YuNet
+  2. MTCNN 和 EdgeFace 在 CUDA 上运行（config.yaml device: cuda）
+  3. 使用 EdgeFace/MTCNN 官方五点对齐参考坐标
+  4. MTCNN 当前 min_face_size=40，confidence 阈值为 0.5
+  5. 保持输出格式为评测需要的单个人脸对象
+
+perception/config.yaml                   修改 — face.device: cuda
+
+perception/edgeface_src/face_alignment/mtcnn_pytorch/src/weights/
+  pnet.npy, rnet.npy, onet.npy           新增 — MTCNN 预训练权重
+
+Jetson 验证结果:
+  - CUDA 可用，MTCNN 成功加载到 cuda:0
+  - 测试图片尺寸 2160x3840，但未检测到人脸
+  - MTCNN 平均耗时约 1977ms/张，约 0.5 FPS
+  - 单进程 GPU reserved 约 333MB，10 容器估算约 3.3GB
+  - 当前结果超过约 1.6GB 资源目标，且尚未完成准确率评测
+
+perception/Dockerfile.jetson             修改 — 添加 face 依赖 (timm, onnxruntime 等) + COPY edgeface_src
+perception/main.py                       修改 — 加载 FaceRecognitionPlugin + 环境变量端口
+perception/deploy/service.yml            修改 — FastDDS XML 配置
+perception/config/fastdds_large_message.xml  新增 — UDPv4 大消息传输配置
+
+================================================================================
