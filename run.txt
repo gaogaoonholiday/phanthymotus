@@ -1,6 +1,6 @@
 ================================================================================
 人脸识别插件 — Jetson 调试 & 测试操作手册
-EdgeFace (edgeface_s_gamma_05) + MTCNN + PyTorch
+EdgeFace (edgeface_s_gamma_05) + YuNet + ONNX Runtime
 ================================================================================
 
 目录：
@@ -24,7 +24,7 @@ Jetson 设备:   ssh develop@10.100.121.16  (密码: develop)
 个人目录:      /home/develop/dengshiwei/
 代码仓库:      https://github.com/gaogaoonholiday/phanthymotus
 代码分支:      feat/face-recognition
-Commit ID:     073abab
+Commit ID:     a901b40
 
 模型文件 (juicefs):
 URL 前缀:  http://172.28.4.81:34567/face
@@ -49,11 +49,28 @@ URL 前缀:  http://172.28.4.81:34567/face
     "identity": {
         "person_id": "n000001",
         "confidence": 0.8765
+    },
+    "diag": {
+        "faces": 1, "face_px": 94,
+        "top3": [["n000001", 0.877], ["n000002", 0.246]],
+        "gmean": 0.024,
+        "db": "50dirs/50emb nodetect=0 fail=0 imp mean=0.015 med=0.013 p95=0.191 max=0.434 top:..."
     }
 }
 
 bbox_relative 为归一化 [0-1] 坐标，6 位小数，顺序: [x1/W, y1/H, x2/W, y2/H]
 注意: 直接返回人脸对象，不要包装在 faces 数组或 {"image_size":..., "faces":...} 中
+
+diag 字段说明 (a901b40 新增，评测调试用，评测器应忽略未知字段):
+- faces:            本帧检测到的人脸数
+- face_px:          被选人脸的像素宽度
+- top3:             库内相似度前 3 的 [person_id, sim]
+- gmean:            probe 与全部库内身份相似度的均值（库塌缩时会虚高）
+- db:               仅首帧携带 — 人脸库概览: 目录数/embedding 数/检测失败数，
+                    以及库内冒名者相似度统计 (imp mean/med/p95/max) 与最高相似对
+  健康库基线 (LFW 100 人实测): imp mean≈0.015, max<0.45, top1-top2 差 >0.3
+  判读: imp mean>0.4 → 注册库塌缩; top3 前两名差距<0.1 → 判别力不足;
+        gmean>0.5 → 整库向量挤在一起(域差); faces>1 → 图中多人需选脸
 
 ================================================================================
 1. SSH 登录 Jetson
@@ -85,9 +102,9 @@ cd phanthymotus
 
 # 确认 commit
 git log --oneline -3
-# 应看到: 073abab feat: test MTCNN GPU face detection
+# 应看到: a901b40 feat: add face-db quality + match-margin diagnostics ...
+#         c81944d revert: MTCNN GPU — restore YuNet baseline
 #         874c08d fix: publish face object expected by evaluator
-#         e4b4990 revert: roll back to bec23f8 (field mismatch version)
 
 # 确认关键文件存在
 ls perception/plugins/face.py
@@ -309,9 +326,9 @@ docker logs face-test 2>&1 | head -30
 
 # 应看到:
 #   FaceRecognitionPlugin loaded
-#   [face] plugin init: model=edgeface_s_gamma_05, device=cuda, backend=pytorch, face_db_dir=/workspace/face_db
-#   [face] EdgeFace loaded (pytorch): edgeface_s_gamma_05, device=cuda
-#   [face] MTCNN loaded, device=cuda:0, conf=0.5
+#   [face] plugin init: model=edgeface_s_gamma_05, device=cpu, backend=onnx, face_db_dir=/workspace/face_db
+#   [face] EdgeFace loaded (onnx): edgeface_s_gamma_05, providers=['CPUExecutionProvider']
+#   [face] YuNet loaded, conf=0.5
 #   [face] face db loaded: N persons, M embeddings
 
 # ── 6.2 MCP 工具列表 ──
@@ -338,8 +355,8 @@ docker logs face-test 2>&1 | grep "\[face\]"
 # 应看到:
 #   [face] downloading edgeface_s_gamma_05.pt from http://172.28.4.81:34567/...
 #   [face] download complete: /models/face/edgeface_s_gamma_05.pt (14.7 MB)
-#   [face] EdgeFace loaded (pytorch): edgeface_s_gamma_05, device=cuda
-#   [face] MTCNN loaded, device=cuda:0, conf=0.5
+#   [face] EdgeFace loaded (onnx): edgeface_s_gamma_05, providers=['CPUExecutionProvider']
+#   [face] YuNet loaded, conf=0.5
 #   [face] face db loaded: N persons, M embeddings
 
 ================================================================================
@@ -384,7 +401,7 @@ print(f"Device:    {DEVICE}")
 print(f"Test img:  {TEST_IMAGE}")
 
 # ── 1. 加载模型 ──
-print(f"\n[1/4] Loading EdgeFace + MTCNN...")
+print(f"\n[1/4] Loading EdgeFace + YuNet...")
 t0 = time.time()
 adapter = EdgeFaceAdapter(MODEL_NAME, MODEL_DIR, DEVICE)
 t1 = time.time()
@@ -491,10 +508,10 @@ python3 /tmp/test_face.py
 # TEST_IMAGE=/workspace/test.jpg python3 /tmp/test_face.py
 
 # ── 预期输出 ──
-# [1/4] Loading EdgeFace + MTCNN...
+# [1/4] Loading EdgeFace + YuNet...
 #   [face] downloading edgeface_s_gamma_05.pt ...     (首次，如果模型目录为空)
-#   [face] EdgeFace loaded (pytorch): edgeface_s_gamma_05
-#   [face] MTCNN loaded, device=cuda:0, conf=0.5
+#   [face] EdgeFace loaded (onnx): edgeface_s_gamma_05
+#   [face] YuNet loaded, conf=0.5
 #   Model loaded in X.XXs
 # [2/4] Loading face database...
 #   [face] loaded n000001/0001_01.jpg
@@ -643,10 +660,12 @@ curl -s http://localhost:15720 -X POST \
 │ 解决: docker exec -it face-test pip3 install --no-deps timm          │
 └──────────────────────────────────────────────────────────────────────┘
 
-┌─ 问题: MTCNN 权重加载失败 ────────────────────────────────────────────┐
-│ 原因: 容器中缺少 pnet.npy、rnet.npy 或 onet.npy                     │
-│ 解决: 这些权重已随仓库提交，确认 edgeface_src 目录完整复制到镜像中   │
-│       并确认 face.py 能导入 face_alignment.mtcnn                   │
+┌─ 问题: YuNet 权重加载 "FileNotFoundError: .onnx" ──────────────────────┐
+│ 原因: 模型目录中缺少 face_detection_yunet_2023mar.onnx              │
+│ 解决: 容器启动时会自动从 juicefs 下载到 /models/face/ 目录           │
+│       如果网络不通，手动下载:                                         │
+│       cd /models/face                                                │
+│       wget http://172.28.4.81:34567/face/face_detection_yunet_2023mar.onnx │
 └──────────────────────────────────────────────────────────────────────┘
 
 ┌─ 问题: "Cannot uninstall 'PyYAML'" ──────────────────────────────────┐
@@ -664,11 +683,10 @@ curl -s http://localhost:15720 -X POST \
 
 ┌─ 问题: 检测不到人脸 (Detection: 0 face(s)) ────────────────────────┐
 │ 排查: 1) 图片是否为正脸？                                             │
-│       2) 人脸是否太小？MTCNN min_face_size 当前为 40px               │
+│       2) 人脸是否太小？YuNet 在 1280px 宽度检测，太小的人脸可能漏检  │
 │       3) 尝试降低阈值:                                               │
 │          config.yaml 中 confidence 默认 0.5，可临时降到 0.3          │
 │       4) 确认图片解码成功: cv2.imdecode 返回非 None                  │
-│       5) MTCNN GPU 单张高分辨率图片约 2 秒，需关注超时和吞吐量       │
 └──────────────────────────────────────────────────────────────────────┘
 
 ┌─ 问题: person_id 总是 "unknown" ────────────────────────────────────┐
@@ -684,13 +702,14 @@ curl -s http://localhost:15720 -X POST \
 │       如手动修复，参考 Dockerfile.jetson 中的 cv2 修复段落           │
 └──────────────────────────────────────────────────────────────────────┘
 
-┌─ 问题: GPU 占用或显存过高 ─────────────────────────────────────────┐
-│ 当前 MTCNN + EdgeFace 使用 CUDA；单进程约 reserved 333 MB。          │
-│ 10 个容器估算约 3.3 GB，超过约 1.6 GB 目标。                        │
+┌─ 问题: GPU 占用过高 ───────────────────────────────────────────────┐
+│ 要求: GPU < 10%                                                     │
+│ 当前配置 device: cpu，推理不占 GPU；如误开 cuda:                     │
+│   - 单进程 MTCNN/EdgeFace CUDA 上下文约 300MB，10 容器会 OOM        │
+│   - 评测曾出现 exit 137 (OOM killed)                                 │
 │ 排查: 1) 确认 fps 设置合理 (默认 3fps)                              │
-│       2) 用 nvidia-smi 或 tegrastats 监控 GPU/显存:                 │
+│       2) 用 jtop/tegrastats 监控:                                   │
 │          sudo tegrastats --interval 1000 | grep GR3D                │
-│       3) 若资源不满足，恢复 config.yaml 的 device: cpu              │
 └──────────────────────────────────────────────────────────────────────┘
 
 ================================================================================
@@ -701,7 +720,7 @@ curl -s http://localhost:15720 -X POST \
 
 env:
   - name: PHANTHYMOTUS_COMMIT_ID
-    value: "073abab"
+    value: "a901b40"
   - name: PHANTHYMOTUS_REPO
     value: "https://github.com/gaogaoonholiday/phanthymotus.git"
   - name: JP_VERSION
@@ -734,26 +753,50 @@ env:
 附: 文件清单
 ================================================================================
 
-本次提交 (commit 073abab) 修改/新增的文件:
+本次提交 (commit a901b40) 修改的文件:
 
-perception/plugins/face.py              修改 — 切换到 MTCNN GPU + EdgeFace:
-  1. 用 MTCNN 三阶段级联检测器替换 YuNet
-  2. MTCNN 和 EdgeFace 在 CUDA 上运行（config.yaml device: cuda）
-  3. 使用 EdgeFace/MTCNN 官方五点对齐参考坐标
-  4. MTCNN 当前 min_face_size=40，confidence 阈值为 0.5
-  5. 保持输出格式为评测需要的单个人脸对象
+perception/plugins/face.py              修改 — 新增评测诊断日志:
+  1. face_db 加载完成后计算库内"冒名者相似度"统计
+     (imp mean/med/p95/max + 最高相似对)，写入 load_diag
+  2. 每帧发布结果附加 diag 字段: faces/face_px/top3/gmean
+     (首次发布携带 db=load_diag)，随 ROS payload 落入评测 result.log
+  3. 匹配逻辑与输出契约未变，identity 输出不受影响
 
-perception/config.yaml                   修改 — face.device: cuda
+历史提交:
+  c81944d  revert: 撤销 MTCNN GPU (073abab)，恢复 YuNet 基线
+  874c08d  fix: 输出单人脸对象 (首个跑通评测的版本)
 
-perception/edgeface_src/face_alignment/mtcnn_pytorch/src/weights/
-  pnet.npy, rnet.npy, onet.npy           新增 — MTCNN 预训练权重
+================================================================================
+附2: Jetson 本地测试记录 (2026-09-04)
+================================================================================
 
-Jetson 验证结果:
-  - CUDA 可用，MTCNN 成功加载到 cuda:0
-  - 测试图片尺寸 2160x3840，但未检测到人脸
-  - MTCNN 平均耗时约 1977ms/张，约 0.5 FPS
-  - 单进程 GPU reserved 约 333MB，10 容器估算约 3.3GB
-  - 当前结果超过约 1.6GB 资源目标，且尚未完成准确率评测
+1) MTCNN GPU 评测 (commit 073abab):
+   - 评测机 10 容器启动即 OOM: exit code 137，评测中止，无任何 case 完成
+   - 单进程 GPU reserved ~333MB，10 容器 ~3.3GB 超出 ~1.6GB 目标
+   - 2160x3840 大图 MTCNN ~2s/张，~0.5 FPS
+
+2) LFW deepfunneled 对比测试 (100 注册身份 / 300 已知 / 64 未知 probe):
+   ┌──────────────────────────────┬────────┬───────────┬────────────┐
+   │ 变体                          │ 命中率  │ 检测 p50  │ 结论        │
+   ├──────────────────────────────┼────────┼───────────┼────────────┤
+   │ YuNet CPU + 经典ref(38.2946) │ 94.0%  │ 6.7ms     │ 最优(基线)  │
+   │ MTCNN GPU + 修正ref(30.2946) │ 87.0%  │ 37.2ms    │ 更慢更差    │
+   │ YuNet CPU + 修正ref(30.2946) │ 83.0%  │ 6.8ms     │ 对齐ref敏感 │
+   └──────────────────────────────┴────────┴───────────┴────────────┘
+   三者误接受均 1/64；检测零漏检零错认 → 瓶颈不在检测器
+   经典 ref 与 YuNet 地标顺序匹配，"修正 ref"只适用于 MTCNN 地标顺序
+
+3) 评测 result.log (874c08d, accuracy=0.1598) 缺陷分析:
+   - 检测/速度/输出契约均正常 (detect_conf 中位 0.925, p50 0.21s)
+   - 20/194 unknown (相似度 0.1-0.5)；~143 个自信错认 (相似度中位 0.771)
+   - 异常: 错误匹配相似度远超正常跨人水平 (LFW 实测 63/64 <0.5)
+   - 诊断假设: 注册库 embedding 塌缩 或 儿童/域差
+   - 对策: a901b40 诊断日志，下次评测 run 的 result.log 即可判读
+
+4) LFW 测试集 (Jetson /home/develop/dengshiwei/testset/):
+   - face_db/  100 身份各 1 张注册照
+   - probe/    150 身份 364 张 (100 库内 + 50 库外)
+   - 来源: ModelScope Composable/labeled_faces_in_the_wild (LFW deepfunneled)
 
 perception/Dockerfile.jetson             修改 — 添加 face 依赖 (timm, onnxruntime 等) + COPY edgeface_src
 perception/main.py                       修改 — 加载 FaceRecognitionPlugin + 环境变量端口
