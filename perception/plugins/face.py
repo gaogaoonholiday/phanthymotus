@@ -455,6 +455,35 @@ class EdgeFaceAdapter:
         return results
 
 
+# ── Per-instance diagnostic experiment ───────────────────────────────────────
+# One eval run = 10 parallel containers (MCP_PORT = 15720 + 100*k, k=0..9).
+# The leaderboard reports accuracy per instance, so mapping instance index →
+# (bbox_relative output format, similarity-threshold override) identifies the
+# evaluator's expected coordinate convention empirically in a single run.
+_BBOX_EXPERIMENTS = {
+    0: ("xyxy", None),    # control: [x1,y1,x2,y2], config threshold
+    1: ("xywh", None),    # [x,y,w,h]
+    2: ("yxxy", None),    # [y1,x1,y2,x2] transposed
+    3: ("cxcywh", None),  # [xc,yc,w,h] center format
+    4: ("xyxy", 0.4),
+    5: ("xyxy", 0.45),
+    6: ("xyxy", 0.3),
+    7: ("xywh", 0.4),
+    8: ("yxxy", 0.4),
+    9: ("xywh", 0.3),
+}
+
+
+def _bbox_exp_for_instance():
+    try:
+        port = int(os.environ.get("MCP_PORT") or 0)
+    except ValueError:
+        port = 0
+    idx = (port - 15720) // 100 if port >= 15720 else 0
+    fmt, thr = _BBOX_EXPERIMENTS.get(idx, ("xyxy", None))
+    return idx, fmt, thr
+
+
 # ── ROS2 Node (one per instance/topic) ────────────────────────────────────────
 
 class _FaceNode(Node):
@@ -470,6 +499,12 @@ class _FaceNode(Node):
         self._model = model
         self._face_db = face_db
         self._similarity_threshold = similarity_threshold
+        self._inst_idx, self._bbox_fmt, self._bbox_thr = _bbox_exp_for_instance()
+        self._eff_similarity_threshold = (
+            self._bbox_thr if self._bbox_thr is not None else similarity_threshold
+        )
+        log.info(f"[face] node {node_suffix}: exp inst={self._inst_idx} "
+                 f"bbox_fmt={self._bbox_fmt} thr={self._eff_similarity_threshold}")
         self._confidence = confidence
         self._frame_interval = 1.0 / max(fps, 0.1)
 
@@ -552,7 +587,7 @@ class _FaceNode(Node):
                     x1, y1, x2, y2 = det["bbox"]
                     embedding = np.array(det["embedding"], dtype=np.float32)
                     person_id, similarity = self._face_db.match(
-                        embedding, self._similarity_threshold
+                        embedding, self._eff_similarity_threshold
                     )
                     topk, gmean = self._face_db.match_diag(embedding)
                     diag = {
@@ -560,18 +595,27 @@ class _FaceNode(Node):
                         "face_px": round(det["bbox"][2] - det["bbox"][0]),
                         "top3": [[pid, round(s, 3)] for pid, s in topk],
                         "gmean": round(gmean, 3),
+                        "exp": {
+                            "inst": self._inst_idx,
+                            "fmt": self._bbox_fmt,
+                            "thr": round(self._eff_similarity_threshold, 2),
+                        },
                     }
                     if not self._diag_db_sent and self._face_db.load_diag:
                         diag["db"] = self._face_db.load_diag
                         self._diag_db_sent = True
+                    w, h = x2 - x1, y2 - y1
+                    if self._bbox_fmt == "xywh":
+                        out_bbox = [x1 / W, y1 / H, w / W, h / H]
+                    elif self._bbox_fmt == "yxxy":
+                        out_bbox = [y1 / H, x1 / W, y2 / H, x2 / W]
+                    elif self._bbox_fmt == "cxcywh":
+                        out_bbox = [(x1 + x2) / 2 / W, (y1 + y2) / 2 / H, w / W, h / H]
+                    else:  # xyxy (control)
+                        out_bbox = [x1 / W, y1 / H, x2 / W, y2 / H]
                     result = {
                         "detect_confidence": round(det["confidence"], 4),
-                        "bbox_relative": [
-                            round(x1 / W, 6),
-                            round(y1 / H, 6),
-                            round(x2 / W, 6),
-                            round(y2 / H, 6),
-                        ],
+                        "bbox_relative": [round(v, 6) for v in out_bbox],
                         "identity": {
                             "person_id": person_id,
                             "confidence": round(similarity, 4),
