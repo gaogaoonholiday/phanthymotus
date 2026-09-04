@@ -4,17 +4,15 @@ plugins/face.py — FaceRecognitionPlugin: EdgeFace + YuNet face recognition.
 
 Pipeline: CompressedImage → YuNet detect → align (112×112) → EdgeFace embed → identity match
 Downloads weights from juicefs (http://172.28.4.81:34567/).
-Outputs benchmark-compliant JSON (faces array only, no wrapper):
-  [
-    {
-      "detect_confidence": 0.95,
-      "bbox_relative": [x1, y1, x2, y2],  # normalized [0-1]
-      "identity": {
-        "person_id": "n000001",
-        "confidence": 0.91
-      }
+Outputs benchmark-compliant JSON (one highest-confidence face object):
+  {
+    "detect_confidence": 0.95,
+    "bbox_relative": [x1, y1, x2, y2],  # normalized [0-1]
+    "identity": {
+      "person_id": "n000001",
+      "confidence": 0.91
     }
-  ]
+  }
 
 Supports multi-instance (one instance per input topic).
 Follows VOP plugin architecture: CompressedImage subscription, frame queue,
@@ -487,42 +485,37 @@ class _FaceNode(Node):
                 # ── Detect + embed ──
                 detections = self._model.detect_and_embed(rgb_frame)
 
-                # ── Build benchmark-compliant output (faces array only) ──
-                faces = []
-                for det in detections:
+                # The evaluator expects one face object with identity.person_id,
+                # not a list. Select the highest-confidence detection.
+                result = {}
+                if detections:
+                    det = max(detections, key=lambda item: item["confidence"])
                     x1, y1, x2, y2 = det["bbox"]
-
-                    # Normalize bbox to [0, 1]
-                    bbox_relative = [
-                        round(x1 / W, 6),
-                        round(y1 / H, 6),
-                        round(x2 / W, 6),
-                        round(y2 / H, 6),
-                    ]
-
-                    # ── Identity matching ──
                     embedding = np.array(det["embedding"], dtype=np.float32)
                     person_id, similarity = self._face_db.match(
                         embedding, self._similarity_threshold
                     )
-
-                    faces.append({
+                    result = {
                         "detect_confidence": round(det["confidence"], 4),
-                        "bbox_relative": bbox_relative,
+                        "bbox_relative": [
+                            round(x1 / W, 6),
+                            round(y1 / H, 6),
+                            round(x2 / W, 6),
+                            round(y2 / H, 6),
+                        ],
                         "identity": {
                             "person_id": person_id,
                             "confidence": round(similarity, 4),
-                        }
-                    })
+                        },
+                    }
 
                 msg = String()
-                msg.data = json.dumps(faces, ensure_ascii=False)
+                msg.data = json.dumps(result, ensure_ascii=False)
                 self._pub.publish(msg)
 
                 self._detect_count += 1
-                identities = [f["identity"]["person_id"] for f in faces]
-                log.info(f"[face] {len(faces)} face(s): {identities} "
-                         f"(detect+match done)")
+                log.info(f"[face] {len(detections)} face(s), result="
+                         f"{result.get('identity', {}).get('person_id')} (detect+match done)")
 
             except Exception as e:
                 log.error(f"[face] inference error: {e}", exc_info=True)
