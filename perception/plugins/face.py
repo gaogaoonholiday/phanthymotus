@@ -194,6 +194,7 @@ class FaceDatabase:
     def __init__(self):
         self._embeddings: dict[str, list[np.ndarray]] = {}
         self._lock = threading.RLock()
+        self.load_diag: Optional[str] = None
 
     def load_from_dir(self, db_dir: str, adapter: "EdgeFaceAdapter"):
         """Load identity library: detect + embed all faces in db_dir."""
@@ -206,14 +207,17 @@ class FaceDatabase:
 
         with self._lock:
             self._embeddings.clear()
+            n_dirs = n_images = n_fail = 0
 
             for person_dir in sorted(db_path.iterdir()):
                 if not person_dir.is_dir():
                     continue
+                n_dirs += 1
                 person_id = person_dir.name
                 for img_file in sorted(person_dir.iterdir()):
                     if img_file.suffix.lower() not in ('.jpg', '.jpeg', '.png', '.bmp', '.webp'):
                         continue
+                    n_images += 1
                     try:
                         pil_img = Image.open(img_file).convert("RGB")
                         img_arr = np.array(pil_img)
@@ -224,11 +228,49 @@ class FaceDatabase:
                                 np.array(best["embedding"], dtype=np.float32)
                             )
                             log.info(f"[face] loaded {person_id}/{img_file.name}")
+                        else:
+                            n_fail += 1
+                            log.warning(f"[face] no face detected in {img_file}")
                     except Exception as e:
+                        n_fail += 1
                         log.warning(f"[face] failed to load {img_file}: {e}")
 
             total = sum(len(v) for v in self._embeddings.values())
             log.info(f"[face] face db loaded: {len(self._embeddings)} persons, {total} embeddings")
+
+            # ── Gallery quality diagnostics (temporary, for eval debugging) ──
+            ids, embs = [], []
+            for pid, emb_list in self._embeddings.items():
+                for v in emb_list:
+                    ids.append(pid)
+                    embs.append(np.asarray(v, dtype=np.float32))
+            self.load_diag = (
+                f"{n_dirs}dirs/{total}emb "
+                f"nodetect={n_dirs - len(self._embeddings)} fail={n_fail}"
+            )
+            if len(embs) >= 2:
+                E = np.stack(embs)
+                E = E / (np.linalg.norm(E, axis=1, keepdims=True) + 1e-8)
+                S = E @ E.T
+                mask = np.ones_like(S, dtype=bool)
+                np.fill_diagonal(mask, False)
+                ids_arr = np.array(ids)
+                mask &= ids_arr[:, None] != ids_arr[None, :]
+                mask &= np.triu(np.ones_like(mask, dtype=bool))
+                impostor = S[mask]
+                self.load_diag += (
+                    f" imp mean={impostor.mean():.3f} med={float(np.median(impostor)):.3f}"
+                    f" p95={float(np.percentile(impostor, 95)):.3f} max={float(impostor.max()):.3f}"
+                )
+                pairs = sorted(
+                    ((float(S[i, j]), ids[i], ids[j]) for i, j in np.argwhere(mask)),
+                    reverse=True,
+                )[:8]
+                if pairs:
+                    self.load_diag += " top:" + ",".join(
+                        f"{a}~{b}={s:.3f}" for s, a, b in pairs
+                    )
+            log.info(f"[face][diag] db: {self.load_diag}")
 
     def match(self, embedding: np.ndarray, threshold: float) -> tuple[str, float]:
         """Return (person_id, similarity) for best match, or ("unknown", sim)."""
@@ -252,6 +294,22 @@ class FaceDatabase:
             if best_sim >= threshold:
                 return best_id, best_sim
             return "unknown", best_sim
+
+    def match_diag(self, embedding: np.ndarray, k: int = 3):
+        """Return (top-k [(person_id, sim)], mean sim over all gallery persons)."""
+        with self._lock:
+            if not self._embeddings:
+                return [], 0.0
+            query_norm = embedding / (np.linalg.norm(embedding) + 1e-8)
+            per_person = []
+            for person_id, embs in self._embeddings.items():
+                embs_arr = np.array(embs, dtype=np.float32)
+                embs_norm = embs_arr / (np.linalg.norm(embs_arr, axis=1, keepdims=True) + 1e-8)
+                per_person.append((person_id, float(np.max(embs_norm @ query_norm))))
+            per_person.sort(key=lambda x: -x[1])
+            topk = per_person[:k]
+            gmean = float(np.mean([s for _, s in per_person]))
+            return topk, gmean
 
     def is_empty(self) -> bool:
         with self._lock:
@@ -422,6 +480,7 @@ class _FaceNode(Node):
         self._worker: Optional[threading.Thread] = None
         self._last_inference_time = 0.0
         self._detect_count = 0
+        self._diag_db_sent = False
 
     def start(self) -> dict:
         if self._sub is not None:
@@ -495,6 +554,16 @@ class _FaceNode(Node):
                     person_id, similarity = self._face_db.match(
                         embedding, self._similarity_threshold
                     )
+                    topk, gmean = self._face_db.match_diag(embedding)
+                    diag = {
+                        "faces": len(detections),
+                        "face_px": round(det["bbox"][2] - det["bbox"][0]),
+                        "top3": [[pid, round(s, 3)] for pid, s in topk],
+                        "gmean": round(gmean, 3),
+                    }
+                    if not self._diag_db_sent and self._face_db.load_diag:
+                        diag["db"] = self._face_db.load_diag
+                        self._diag_db_sent = True
                     result = {
                         "detect_confidence": round(det["confidence"], 4),
                         "bbox_relative": [
@@ -507,6 +576,7 @@ class _FaceNode(Node):
                             "person_id": person_id,
                             "confidence": round(similarity, 4),
                         },
+                        "diag": diag,
                     }
 
                 msg = String()
