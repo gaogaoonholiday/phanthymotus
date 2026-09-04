@@ -83,7 +83,7 @@ TOOLS = [
         "name": "face",
         "type": "processor",
         "multiInstance": True,
-                "description": "Face Recognition — detect and identify faces using EdgeFace + YuNet/MTCNN",
+        "description": "Face Recognition — detect and identify faces using EdgeFace + YuNet",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -145,20 +145,6 @@ TOOLS = [
                     "default": "cpu",
                     "scope": "shared",
                 },
-                "inference_backend": {
-                    "type": "string",
-                    "enum": ["pytorch", "onnx"],
-                    "description": "EdgeFace inference backend: 'onnx' uses ONNX Runtime (2-3x faster on CPU), 'pytorch' uses PyTorch",
-                    "default": "pytorch",
-                    "scope": "shared",
-                },
-                "detector": {
-                    "type": "string",
-                    "enum": ["yunet", "mtcnn"],
-                    "description": "Face detector: 'yunet' (OpenCV, CPU, fast) or 'mtcnn' (PyTorch, GPU, accurate landmarks)",
-                    "default": "yunet",
-                    "scope": "shared",
-                },
             },
         },
         "topic_in":  [{"format": "image/jpeg", "desc": "camera image input"}],
@@ -169,42 +155,9 @@ TOOLS = [
 
 # ── Model download ────────────────────────────────────────────────────────────
 
-def _ensure_weights(model_name: str, model_dir: str,
-                    need_onnx: bool = False, need_mtcnn: bool = False) -> str:
-    """Download model weights from juicefs if not present.
-
-    Args:
-        model_name: EdgeFace model name (e.g. edgeface_s_gamma_05)
-        model_dir: Directory for model weights
-        need_onnx: If True, download .onnx; otherwise download .pt
-        need_mtcnn: If True, download MTCNN .npy weights to edgeface_src
-
-    Returns:
-        Path to the checkpoint (.pt) or ONNX model (.onnx)
-    """
+def _ensure_weights(model_name: str, model_dir: str) -> str:
+    """Download model weights from juicefs if not present. Returns checkpoint path."""
     os.makedirs(model_dir, exist_ok=True)
-
-    if need_onnx:
-        # EdgeFace ONNX model
-        onnx_filename = f"{model_name}.onnx"
-        onnx_path = os.path.join(model_dir, onnx_filename)
-        if not os.path.exists(onnx_path):
-            url = f"{_MODEL_BASE_URL}/{onnx_filename}"
-            log.info(f"[face] downloading {onnx_filename} from {url} → {onnx_path}")
-            urllib.request.urlretrieve(url, onnx_path)
-            log.info(f"[face] download complete: {onnx_path} ({os.path.getsize(onnx_path) / 1e6:.1f} MB)")
-        # Still need the .pt for face_db loading (FaceDatabase uses PyTorch adapter)
-        ckpt_filename = f"{model_name}.pt"
-        ckpt_path = os.path.join(model_dir, ckpt_filename)
-        if not os.path.exists(ckpt_path):
-            url = f"{_MODEL_BASE_URL}/{ckpt_filename}"
-            log.info(f"[face] downloading {ckpt_filename} from {url} → {ckpt_path}")
-            urllib.request.urlretrieve(url, ckpt_path)
-            log.info(f"[face] download complete: {ckpt_path} ({os.path.getsize(ckpt_path) / 1e6:.1f} MB)")
-        # Download MTCNN weights if needed
-        if need_mtcnn:
-            _ensure_mtcnn_weights()
-        return ckpt_path
 
     # EdgeFace checkpoint
     ckpt_filename = f"{model_name}.pt"
@@ -215,44 +168,16 @@ def _ensure_weights(model_name: str, model_dir: str,
         urllib.request.urlretrieve(url, ckpt_path)
         log.info(f"[face] download complete: {ckpt_path} ({os.path.getsize(ckpt_path) / 1e6:.1f} MB)")
 
-    # YuNet ONNX model (needed for yunet detector)
-    if not need_mtcnn:
-        yunet_filename = "face_detection_yunet_2023mar.onnx"
-        yunet_path = os.path.join(model_dir, yunet_filename)
-        if not os.path.exists(yunet_path):
-            url = f"{_MODEL_BASE_URL}/{yunet_filename}"
-            log.info(f"[face] downloading {yunet_filename} from {url}")
-            urllib.request.urlretrieve(url, yunet_path)
-            log.info(f"[face] download complete: {yunet_path} ({os.path.getsize(yunet_path) / 1e6:.1f} MB)")
-
-    # Download MTCNN weights if needed
-    if need_mtcnn:
-        _ensure_mtcnn_weights()
+    # YuNet ONNX model
+    yunet_filename = "face_detection_yunet_2023mar.onnx"
+    yunet_path = os.path.join(model_dir, yunet_filename)
+    if not os.path.exists(yunet_path):
+        url = f"{_MODEL_BASE_URL}/{yunet_filename}"
+        log.info(f"[face] downloading {yunet_filename} from {url}")
+        urllib.request.urlretrieve(url, yunet_path)
+        log.info(f"[face] download complete: {yunet_path} ({os.path.getsize(yunet_path) / 1e6:.1f} MB)")
 
     return ckpt_path
-
-
-def _ensure_mtcnn_weights():
-    """Download MTCNN .npy weights from juicefs to the expected path.
-
-    MTCNN loads weights via np.load('mtcnn_pytorch/src/weights/pnet.npy')
-    with a relative path, so they must be in the edgeface_src/face_alignment/
-    directory tree. On the Docker image this path is /work/edgeface_src/
-    face_alignment/.
-    """
-    mtcnn_weights_dir = os.path.join(
-        _EDGEFACE_SRC, "face_alignment", "mtcnn_pytorch", "src", "weights",
-    )
-    os.makedirs(mtcnn_weights_dir, exist_ok=True)
-
-    for name in ("pnet.npy", "rnet.npy", "onet.npy"):
-        dst = os.path.join(mtcnn_weights_dir, name)
-        if os.path.exists(dst) and os.path.getsize(dst) > 0:
-            continue
-        url = f"{_MODEL_BASE_URL}/mtcnn/{name}"
-        log.info(f"[face] downloading MTCNN {name} from {url}")
-        urllib.request.urlretrieve(url, dst)
-        log.info(f"[face] MTCNN {name} downloaded ({os.path.getsize(dst) / 1e3:.0f} KB)")
 
 
 # ── Face Database (Identity Library) ─────────────────────────────────────────
@@ -352,69 +277,30 @@ _DETECT_TARGET_W = 1280
 
 
 class EdgeFaceAdapter:
-    """Face detection + EdgeFace embedding extraction.
+    """YuNet face detection + EdgeFace embedding extraction.
 
-    Two detector options:
-      - 'yunet': OpenCV FaceDetectorYN, single-stage, CPU only (~250ms)
-      - 'mtcnn': PyTorch MTCNN three-stage cascade, runs on GPU (~2s) or CPU
+    YuNet (OpenCV FaceDetectorYN) is a single-stage detector — no image pyramid,
+    ~250ms on CPU for 1280px. EdgeFace runs on CPU (~189ms) or GPU (~26ms).
+    Model weights are auto-downloaded from juicefs.
 
-    Two inference backends for EdgeFace:
-      - 'pytorch': PyTorch EdgeFace, ~189ms/embed on CPU (1 thread)
-      - 'onnx':    ONNX Runtime, ~60-80ms/embed on CPU (2-3x faster)
-
-    Batch embedding: all detected faces are stacked into one forward pass.
-
-    detector='yunet', device='cpu':  ~440ms/frame, ~2.3 fps
-    detector='mtcnn', device='cuda': EdgeFace ~26ms + MTCNN ~2s (first call),
-                  MTCNN is slow but very accurate. Best for quality.
+    device='cpu':  ~440ms/frame, ~2.3 fps, no CUDA context — safe for 10 containers
+    device='cuda': ~335ms/frame, ~3.0 fps, but 10 containers may OOM on 16GB Orin
     """
 
     def __init__(self, model_name: str, model_dir: str, device: str = "cpu",
-                 confidence: float = 0.5, inference_backend: str = "pytorch",
-                 detector: str = "yunet"):
+                 confidence: float = 0.5):
         import torch
+        from torchvision import transforms
 
         self._device = torch.device(
             device if device == "cuda" and torch.cuda.is_available() else "cpu"
         )
         torch.set_num_threads(1)
-        self._inference_backend = inference_backend
-        self._detector_type = detector
-        self._confidence = confidence
 
         # Download weights from juicefs
-        ckpt_path = _ensure_weights(
-            model_name, model_dir,
-            need_onnx=(inference_backend == "onnx"),
-            need_mtcnn=(detector == "mtcnn"),
-        )
+        ckpt_path = _ensure_weights(model_name, model_dir)
 
-        if inference_backend == "onnx":
-            try:
-                self._init_onnx(model_name, model_dir)
-            except Exception as e:
-                log.warning(f"[face] ONNX init failed ({e}), falling back to PyTorch")
-                self._inference_backend = "pytorch"
-                self._init_pytorch(model_name, ckpt_path)
-        else:
-            self._init_pytorch(model_name, ckpt_path)
-
-        # ── Face detector ──
-        if detector == "mtcnn":
-            self._init_mtcnn()
-        else:
-            self._init_yunet(model_dir, confidence)
-
-        # ── Preprocessing transform (same as training) ──
-        from torchvision import transforms
-        self._transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
-
-    def _init_pytorch(self, model_name: str, ckpt_path: str):
-        """Load PyTorch EdgeFace model."""
-        import torch
+        # ── Load EdgeFace backbone ──
         from backbones import get_model
 
         self._model_name = model_name
@@ -422,35 +308,9 @@ class EdgeFaceAdapter:
         state_dict = torch.load(ckpt_path, map_location=self._device)
         self._model.load_state_dict(state_dict)
         self._model.to(self._device).eval()
-        self._ort_session = None
-        log.info(f"[face] EdgeFace loaded (pytorch): {model_name}, device={self._device}")
+        log.info(f"[face] EdgeFace loaded: {model_name}, device={self._device}")
 
-    def _init_onnx(self, model_name: str, model_dir: str):
-        """Load ONNX Runtime EdgeFace session."""
-        import onnxruntime as ort
-
-        onnx_path = os.path.join(model_dir, f"{model_name}.onnx")
-        if not os.path.exists(onnx_path):
-            raise FileNotFoundError(
-                f"ONNX model not found: {onnx_path}. "
-                f"Run export_edgeface_onnx.py first."
-            )
-
-        sess_opts = ort.SessionOptions()
-        sess_opts.intra_op_num_threads = 1
-        sess_opts.inter_op_num_threads = 1
-
-        providers = ["CPUExecutionProvider"]
-        if str(self._device) == "cuda" and "CUDAExecutionProvider" in ort.get_available_providers():
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-
-        self._ort_session = ort.InferenceSession(onnx_path, sess_opts, providers=providers)
-        self._model = None
-        self._model_name = model_name
-        log.info(f"[face] EdgeFace loaded (onnx): {model_name}, providers={providers}")
-
-    def _init_yunet(self, model_dir: str, confidence: float):
-        """Load YuNet face detector (OpenCV FaceDetectorYN, CPU only)."""
+        # ── YuNet detector (OpenCV ONNX) ──
         import cv2
         yunet_path = os.path.join(model_dir, "face_detection_yunet_2023mar.onnx")
         self._detector = cv2.FaceDetectorYN_create(
@@ -459,57 +319,17 @@ class EdgeFaceAdapter:
             nms_threshold=0.3,
             top_k=5000,
         )
-        self._mtcnn = None
+        self._confidence = confidence
         log.info(f"[face] YuNet loaded, conf={confidence}")
 
-    def _init_mtcnn(self):
-        """Load MTCNN face detector (PyTorch, runs on GPU or CPU).
-
-        MTCNN three-stage cascade (PNet→RNet→ONet) with image pyramid.
-        Very accurate landmark detection. On GPU ~2s/frame, on CPU ~6.6s/frame.
-        Weights are downloaded from juicefs by _ensure_weights.
-        """
-        from face_alignment import mtcnn as mtcnn_mod
-
-        device_str = "cuda:0" if str(self._device) == "cuda" else "cpu"
-        self._mtcnn = mtcnn_mod.MTCNN(device=device_str, crop_size=(112, 112))
-        self._detector = None
-        log.info(f"[face] MTCNN loaded, device={device_str}")
-
-    def _embed_batch(self, aligned_faces: list[np.ndarray]) -> np.ndarray:
-        """Extract embeddings for a batch of aligned 112×112 face images.
-
-        Args:
-            aligned_faces: list of RGB numpy arrays, each (112, 112, 3)
-
-        Returns:
-            (N, 512) embeddings array
-        """
-        import torch
-        from PIL import Image
-
-        if not aligned_faces:
-            return np.zeros((0, 512), dtype=np.float32)
-
-        # Stack all faces into one batch tensor
-        tensors = [self._transform(Image.fromarray(f)) for f in aligned_faces]
-        batch = torch.stack(tensors).to(self._device)
-
-        if self._inference_backend == "onnx" and self._ort_session is not None:
-            embeddings = self._ort_session.run(
-                ["embedding"], {"input": batch.cpu().numpy()}
-            )[0]
-        else:
-            with torch.no_grad():
-                embeddings = self._model(batch).cpu().numpy()
-
-        return embeddings
+        # ── Preprocessing transform (same as training) ──
+        self._transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
 
     def detect_and_embed(self, image: np.ndarray) -> list[dict]:
         """Detect faces, align, extract embeddings.
-
-        Uses batch embedding: all faces are aligned first, then passed
-        through EdgeFace in a single forward pass.
 
         Args:
             image: RGB numpy array (H, W, 3)
@@ -520,73 +340,9 @@ class EdgeFaceAdapter:
               - bbox: [x1, y1, x2, y2] in pixel coords (original resolution)
               - confidence: float
         """
-        if self._detector_type == "mtcnn":
-            return self._detect_and_embed_mtcnn(image)
-        return self._detect_and_embed_yunet(image)
-
-    def _detect_and_embed_mtcnn(self, image: np.ndarray) -> list[dict]:
-        """MTCNN detection + EdgeFace embedding (GPU pipeline)."""
-        from PIL import Image as PILImage
-
-        pil_img = PILImage.fromarray(image)
-        W_orig, H_orig = pil_img.size
-
-        # MTCNN detect + align in one call
-        boxes, landmarks = self._mtcnn.detect_faces(
-            pil_img,
-            self._mtcnn.min_face_size,
-            self._mtcnn.thresholds,
-            self._mtcnn.nms_thresholds,
-            self._mtcnn.factor,
-        )
-
-        if len(boxes) == 0:
-            return []
-
-        # Align all faces using MTCNN's warp_and_crop_face
-        from face_alignment.mtcnn_pytorch.src.align_trans import (
-            get_reference_facial_points, warp_and_crop_face,
-        )
-        ref = get_reference_facial_points(default_square=True)
-
-        aligned_faces = []
-        bboxes = []
-        confidences = []
-
-        for i in range(len(boxes)):
-            conf = float(boxes[i][4])
-            if conf < self._confidence:
-                continue
-            facial5points = [
-                [landmarks[i][j], landmarks[i][j + 5]] for j in range(5)
-            ]
-            warped = warp_and_crop_face(
-                image, facial5points, ref, crop_size=(112, 112),
-            )
-            aligned_faces.append(warped)
-            bboxes.append([
-                float(boxes[i][0]), float(boxes[i][1]),
-                float(boxes[i][2]), float(boxes[i][3]),
-            ])
-            confidences.append(conf)
-
-        if not aligned_faces:
-            return []
-
-        embeddings = self._embed_batch(aligned_faces)
-
-        results = []
-        for emb, bbox, conf in zip(embeddings, bboxes, confidences):
-            results.append({
-                "embedding": emb,
-                "bbox": bbox,
-                "confidence": conf,
-            })
-        return results
-
-    def _detect_and_embed_yunet(self, image: np.ndarray) -> list[dict]:
-        """YuNet detection + EdgeFace embedding (CPU pipeline)."""
         import cv2
+        import torch
+        from PIL import Image
 
         H_orig, W_orig = image.shape[:2]
 
@@ -607,11 +363,7 @@ class EdgeFaceAdapter:
         if faces is None:
             return []
 
-        # ── Collect aligned faces + metadata ──
-        aligned_faces = []
-        bboxes = []
-        confidences = []
-
+        results = []
         for f in faces:
             if f[14] < self._confidence:
                 continue
@@ -627,25 +379,21 @@ class EdgeFaceAdapter:
             if M is None:
                 continue
             aligned = cv2.warpAffine(img_det, M, (112, 112), borderValue=0)
-            aligned_faces.append(aligned)
+
+            # EdgeFace embedding
+            tensor = self._transform(Image.fromarray(aligned)).unsqueeze(0).to(self._device)
+            with torch.no_grad():
+                embedding = self._model(tensor)
+            embedding = embedding.cpu().numpy().flatten()
 
             # Scale bbox back to original resolution
             x, y, w, h = float(f[0]), float(f[1]), float(f[2]), float(f[3])
-            bboxes.append([x / scale, y / scale, (x + w) / scale, (y + h) / scale])
-            confidences.append(float(f[14]))
+            bbox = [x / scale, y / scale, (x + w) / scale, (y + h) / scale]
 
-        if not aligned_faces:
-            return []
-
-        # ── Batch embedding extraction ──
-        embeddings = self._embed_batch(aligned_faces)
-
-        results = []
-        for i, (emb, bbox, conf) in enumerate(zip(embeddings, bboxes, confidences)):
             results.append({
-                "embedding": emb,
+                "embedding": embedding,
                 "bbox": bbox,
-                "confidence": conf,
+                "confidence": float(f[14]),
             })
 
         return results
@@ -789,8 +537,6 @@ class FaceRecognitionPlugin:
         self._executor = executor
         self._model_name = plugin_cfg.get("model", DEFAULT_MODEL_NAME)
         self._device = plugin_cfg.get("device", "cpu")
-        self._inference_backend = plugin_cfg.get("inference_backend", "pytorch")
-        self._detector = plugin_cfg.get("detector", "yunet")
         self._face_db_dir = plugin_cfg.get("face_db_dir") or os.getenv("FACE_DB_DIR", "/workspace/face_db")
         self._model_dir = plugin_cfg.get("model_dir", "/models/face")
         self._similarity_threshold = float(plugin_cfg.get("similarity_threshold", DEFAULT_SIMILARITY_THRESHOLD))
@@ -808,7 +554,6 @@ class FaceRecognitionPlugin:
         self._instance_configs: dict[str, dict] = {}
 
         log.info(f"[face] plugin init: model={self._model_name}, device={self._device}, "
-                 f"backend={self._inference_backend}, detector={self._detector}, "
                  f"face_db_dir={self._face_db_dir}")
 
         # Pre-load model at startup so it's ready before evaluation calls start.
@@ -849,8 +594,6 @@ class FaceRecognitionPlugin:
             self._model = EdgeFaceAdapter(
                 self._model_name, self._model_dir, self._device,
                 confidence=self._confidence,
-                inference_backend=self._inference_backend,
-                detector=self._detector,
             )
 
             # Load identity library
@@ -983,10 +726,6 @@ class FaceRecognitionPlugin:
                     self._model_name = cfg["model"]
                 if "device" in cfg:
                     self._device = cfg["device"]
-                if "inference_backend" in cfg:
-                    self._inference_backend = cfg["inference_backend"]
-                if "detector" in cfg:
-                    self._detector = cfg["detector"]
                 if "face_db_dir" in cfg:
                     self._face_db_dir = cfg["face_db_dir"]
                 if "model_dir" in cfg:
