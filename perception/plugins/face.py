@@ -264,10 +264,10 @@ class FaceDatabase:
 
 # ── EdgeFace + YuNet Adapter ──────────────────────────────────────────────────
 
-# EdgeFace/MTCNN 5-point reference for 112×112 alignment
+# ArcFace 5-point reference for 112×112 alignment
 _ARCFACE_REF = np.array([
-    [30.2946, 51.6963], [65.5318, 51.5014], [48.0252, 71.7366],
-    [33.5493, 92.3655], [62.7299, 92.2041],
+    [38.2946, 51.6963], [73.5318, 51.6963], [56.0252, 71.7366],
+    [41.5493, 92.3655], [70.7299, 92.3655],
 ], dtype=np.float32)
 
 # Resize input to this width for detection (speed/accuracy trade-off)
@@ -308,15 +308,17 @@ class EdgeFaceAdapter:
         self._model.to(self._device).eval()
         log.info(f"[face] EdgeFace loaded: {model_name}, device={self._device}")
 
-        # ── MTCNN detector and landmark aligner ──
-        from face_alignment import mtcnn
-
-        mtcnn_device = "cuda:0" if self._device.type == "cuda" else "cpu"
-        self._detector = mtcnn.MTCNN(device=mtcnn_device, crop_size=(112, 112))
-        self._detector.thresholds = [confidence, confidence, confidence]
-        self._detector.min_face_size = 40
+        # ── YuNet detector (OpenCV ONNX) ──
+        import cv2
+        yunet_path = os.path.join(model_dir, "face_detection_yunet_2023mar.onnx")
+        self._detector = cv2.FaceDetectorYN_create(
+            yunet_path, "", (320, 320),
+            score_threshold=confidence,
+            nms_threshold=0.3,
+            top_k=5000,
+        )
         self._confidence = confidence
-        log.info(f"[face] MTCNN loaded, device={mtcnn_device}, conf={confidence}")
+        log.info(f"[face] YuNet loaded, conf={confidence}")
 
         # ── Preprocessing transform (same as training) ──
         self._transform = transforms.Compose([
@@ -341,43 +343,55 @@ class EdgeFaceAdapter:
         from PIL import Image
 
         H_orig, W_orig = image.shape[:2]
-        pil_image = Image.fromarray(image)
 
-        boxes, landmarks = self._detector.detect_faces(
-            pil_image,
-            self._detector.min_face_size,
-            self._detector.thresholds,
-            self._detector.nms_thresholds,
-            self._detector.factor,
-        )
-        if len(boxes) == 0:
+        # ── Resize for detection (speed) ──
+        if W_orig > _DETECT_TARGET_W:
+            scale = _DETECT_TARGET_W / W_orig
+            new_h, new_w = int(H_orig * scale), _DETECT_TARGET_W
+            img_det = cv2.resize(image, (new_w, new_h))
+        else:
+            scale = 1.0
+            new_h, new_w = H_orig, W_orig
+            img_det = image
+
+        # YuNet expects (W, H) for setInputSize
+        self._detector.setInputSize((new_w, new_h))
+        _, faces = self._detector.detect(img_det)
+
+        if faces is None:
             return []
 
         results = []
-        for box, landmark_row in zip(boxes, landmarks):
-            confidence = float(box[4])
-            if confidence < self._confidence:
+        for f in faces:
+            if f[14] < self._confidence:
                 continue
 
-            landmarks_xy = np.array(
-                [[landmark_row[j], landmark_row[j + 5]] for j in range(5)],
-                dtype=np.float32,
-            )
-            M = cv2.estimateAffinePartial2D(landmarks_xy, _ARCFACE_REF)[0]
+            # 5 landmarks: right_eye, left_eye, nose, right_mouth, left_mouth
+            landmarks = np.array([
+                [f[4], f[5]], [f[6], f[7]], [f[8], f[9]],
+                [f[10], f[11]], [f[12], f[13]],
+            ], dtype=np.float32)
+
+            # Affine align to 112×112
+            M = cv2.estimateAffinePartial2D(landmarks, _ARCFACE_REF)[0]
             if M is None:
                 continue
-            aligned = cv2.warpAffine(image, M, (112, 112), borderValue=0)
+            aligned = cv2.warpAffine(img_det, M, (112, 112), borderValue=0)
 
+            # EdgeFace embedding
             tensor = self._transform(Image.fromarray(aligned)).unsqueeze(0).to(self._device)
             with torch.no_grad():
                 embedding = self._model(tensor)
             embedding = embedding.cpu().numpy().flatten()
 
-            x1, y1, x2, y2 = map(float, box[:4])
+            # Scale bbox back to original resolution
+            x, y, w, h = float(f[0]), float(f[1]), float(f[2]), float(f[3])
+            bbox = [x / scale, y / scale, (x + w) / scale, (y + h) / scale]
+
             results.append({
                 "embedding": embedding,
-                "bbox": [x1, y1, x2, y2],
-                "confidence": confidence,
+                "bbox": bbox,
+                "confidence": float(f[14]),
             })
 
         return results
