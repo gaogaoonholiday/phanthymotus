@@ -326,8 +326,8 @@ docker logs face-test 2>&1 | head -30
 
 # 应看到:
 #   FaceRecognitionPlugin loaded
-#   [face] plugin init: model=edgeface_s_gamma_05, device=cpu, backend=onnx, face_db_dir=/workspace/face_db
-#   [face] EdgeFace loaded (onnx): edgeface_s_gamma_05, providers=['CPUExecutionProvider']
+#   [face] plugin init: model=edgeface_s_gamma_05, device=cpu, face_db_dir=/workspace/face_db
+#   [face] EdgeFace loaded: edgeface_s_gamma_05, device=cpu   ← PyTorch 推理（无 ONNX 后端）
 #   [face] YuNet loaded, conf=0.5
 #   [face] face db loaded: N persons, M embeddings
 
@@ -355,9 +355,10 @@ docker logs face-test 2>&1 | grep "\[face\]"
 # 应看到:
 #   [face] downloading edgeface_s_gamma_05.pt from http://172.28.4.81:34567/...
 #   [face] download complete: /models/face/edgeface_s_gamma_05.pt (14.7 MB)
-#   [face] EdgeFace loaded (onnx): edgeface_s_gamma_05, providers=['CPUExecutionProvider']
+#   [face] EdgeFace loaded: edgeface_s_gamma_05, device=cpu
 #   [face] YuNet loaded, conf=0.5
 #   [face] face db loaded: N persons, M embeddings
+#   [face][diag] db: 50dirs/50emb nodetect=0 fail=0 imp mean=0.015 ...
 
 ================================================================================
 7. 单张图片端到端测试（不依赖 ROS2）
@@ -510,7 +511,7 @@ python3 /tmp/test_face.py
 # ── 预期输出 ──
 # [1/4] Loading EdgeFace + YuNet...
 #   [face] downloading edgeface_s_gamma_05.pt ...     (首次，如果模型目录为空)
-#   [face] EdgeFace loaded (onnx): edgeface_s_gamma_05
+#   [face] EdgeFace loaded: edgeface_s_gamma_05, device=cpu
 #   [face] YuNet loaded, conf=0.5
 #   Model loaded in X.XXs
 # [2/4] Loading face database...
