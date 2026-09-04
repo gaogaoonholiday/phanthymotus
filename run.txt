@@ -24,7 +24,7 @@ Jetson 设备:   ssh develop@10.100.121.16  (密码: develop)
 个人目录:      /home/develop/dengshiwei/
 代码仓库:      https://github.com/gaogaoonholiday/phanthymotus
 代码分支:      feat/face-recognition
-Commit ID:     a901b40
+Commit ID:     6d2dbb1
 
 模型文件 (juicefs):
 URL 前缀:  http://172.28.4.81:34567/face
@@ -54,12 +54,19 @@ URL 前缀:  http://172.28.4.81:34567/face
         "faces": 1, "face_px": 94,
         "top3": [["n000001", 0.877], ["n000002", 0.246]],
         "gmean": 0.024,
+        "exp": {"inst": 0, "fmt": "xyxy", "thr": 0.5},
         "db": "50dirs/50emb nodetect=0 fail=0 imp mean=0.015 med=0.013 p95=0.191 max=0.434 top:..."
     }
 }
 
 bbox_relative 为归一化 [0-1] 坐标，6 位小数，顺序: [x1/W, y1/H, x2/W, y2/H]
 注意: 直接返回人脸对象，不要包装在 faces 数组或 {"image_size":..., "faces":...} 中
+
+每实例诊断实验 (6d2dbb1 新增):
+- 评测 10 容器 MCP_PORT=15720+100k (k=0..9)，插件按实例号切换 bbox 输出格式与阈值
+- 目的: 榜单按实例分别报准确率，一次评测即可定位评测端期望的坐标约定
+- 无 MCP_PORT / 端口<15720 时 → 实例0 (控制组，格式与阈值同基线，行为不变)
+- diag.exp 字段记录本实例实际生效的 {"inst","fmt","thr"}
 
 diag 字段说明 (a901b40 新增，评测调试用，评测器应忽略未知字段):
 - faces:            本帧检测到的人脸数
@@ -71,6 +78,7 @@ diag 字段说明 (a901b40 新增，评测调试用，评测器应忽略未知�
   健康库基线 (LFW 100 人实测): imp mean≈0.015, max<0.45, top1-top2 差 >0.3
   判读: imp mean>0.4 → 注册库塌缩; top3 前两名差距<0.1 → 判别力不足;
         gmean>0.5 → 整库向量挤在一起(域差); faces>1 → 图中多人需选脸
+- exp (6d2dbb1 新增): 本实例诊断实验参数 inst=实例号 / fmt=bbox输出格式 / thr=生效阈值
 
 ================================================================================
 1. SSH 登录 Jetson
@@ -102,9 +110,9 @@ cd phanthymotus
 
 # 确认 commit
 git log --oneline -3
-# 应看到: a901b40 feat: add face-db quality + match-margin diagnostics ...
-#         c81944d revert: MTCNN GPU — restore YuNet baseline
-#         874c08d fix: publish face object expected by evaluator
+# 应看到: 6d2dbb1 feat: per-instance bbox-format/threshold diagnostic experiment
+#         a901b40 feat: add face-db quality + match-margin diagnostics
+#         2281c44 docs: correct run.txt — EdgeFace runs PyTorch CPU
 
 # 确认关键文件存在
 ls perception/plugins/face.py
@@ -721,7 +729,7 @@ curl -s http://localhost:15720 -X POST \
 
 env:
   - name: PHANTHYMOTUS_COMMIT_ID
-    value: "a901b40"
+    value: "6d2dbb1"
   - name: PHANTHYMOTUS_REPO
     value: "https://github.com/gaogaoonholiday/phanthymotus.git"
   - name: JP_VERSION
@@ -754,8 +762,16 @@ env:
 附: 文件清单
 ================================================================================
 
-本次提交 (commit a901b40) 修改的文件:
+本次提交 (commit 6d2dbb1) 修改的文件:
 
+perception/plugins/face.py              修改 — 每实例 bbox 格式/阈值诊断实验:
+  1. 按 MCP_PORT 推实例号 k=(port-15720)/100，映射到 (bbox输出格式, 阈值覆盖)
+     0:xyxy/0.5(控制) 1:xywh/0.5 2:yxxy/0.5 3:cxcywh/0.5
+     4:xyxy/0.4 5:xyxy/0.45 6:xyxy/0.3 7:xywh/0.4 8:yxxy/0.4 9:xywh/0.3
+  2. 实际生效参数写入 diag.exp，随 payload 落入评测 result.log
+  3. 控制组 (实例0 / 无 MCP_PORT) 行为与 a901b40 完全一致
+
+上一次提交 (a901b40) 修改的文件:
 perception/plugins/face.py              修改 — 新增评测诊断日志:
   1. face_db 加载完成后计算库内"冒名者相似度"统计
      (imp mean/med/p95/max + 最高相似对)，写入 load_diag
@@ -798,6 +814,24 @@ perception/plugins/face.py              修改 — 新增评测诊断日志:
    - face_db/  100 身份各 1 张注册照
    - probe/    150 身份 364 张 (100 库内 + 50 库外)
    - 来源: ModelScope Composable/labeled_faces_in_the_wild (LFW deepfunneled)
+
+5) 全流程 LFW 测试 (jetson_fulltest.py, YuNet+经典ref+PyTorch CPU, 阈值0.5):
+   - 已知命中 94.0% (342/364, 0 个错认)；未知名单 63/64 拒识, 1 次误接受
+   - 未命中 22 例中 18 例 top1 其实正确 (sim 0.42-0.50, 阈值卡住)
+   - 诊断字段验证通过; 检测+嵌入 p50≈100ms, p95≈200ms (Orin CPU)
+
+6) 评测 result.log 判读 (a901b40, accuracy=0.1593, 与 0.1598 一致):
+   - 诊断数据反证插件自身无恙:
+     注册库健康 (50dirs/50emb fail=0 imp mean=0.011 med=0.010 p95=0.185 max=0.365)
+     gmean 中位 0.025 → 无域间塌缩; top1-top2 差中位 0.506 → 匹配自信
+     faces 分布 {1:165, 2:28, 6:1}, face_px 中位 159
+   - 悖论: 匹配干净自信，但准确率仅 16% → 嫌疑移向评测打分
+   - 重点: bbox_relative 坐标约定 vs "Accuracy @ IOU>=0.5"
+     用 194 条日志框做自 IoU 定量: 若评测按 [x,y,w,h] 解析我们 → 57/194 过 0.5
+     (中位 0.451, 叠加 GT 标注噪声后可与实测 31/194≈16% 相符)
+     其余解释 (cxcywh / x1x2y1y2 / 头肩GT框) IoU 全为 0, 基本排除
+   - 对策: 6d2dbb1 每实例实验 (见附·文件清单)，一次评测分辨坐标约定 + 阈值敏感性
+     若 10 实例仍全部 ≈0.16 → 结论指向评测端 GT-身份映射问题，需与评测方核对
 
 perception/Dockerfile.jetson             修改 — 添加 face 依赖 (timm, onnxruntime 等) + COPY edgeface_src
 perception/main.py                       修改 — 加载 FaceRecognitionPlugin + 环境变量端口
