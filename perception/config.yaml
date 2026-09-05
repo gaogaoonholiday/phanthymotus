@@ -88,7 +88,7 @@ plugins:
     provider: local
     url: ""
     key: ""
-    model: edgeface_s_gamma_05   # 3.65M params, ~14MB — fits <30M constraint
+    model: edgeface_base         # 18.23M params — best accuracy, flat FA curve at low thresholds
     device: cpu                 # YuNet detector ~250ms on CPU, EdgeFace ~189ms on CPU
                                 # Total ~440ms/frame, ~2.3 fps — under 3 fps limit
                                 # CPU mode avoids CUDA context overhead for 10 containers
