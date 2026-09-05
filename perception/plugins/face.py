@@ -58,7 +58,7 @@ _MODEL_BASE_URL = os.environ.get(
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DEFAULT_SIMILARITY_THRESHOLD = 0.5  # cosine similarity above this = same person
-DEFAULT_MODEL_NAME = "edgeface_base"  # 18.23M params, ~73MB checkpoint, best LFW accuracy
+DEFAULT_MODEL_NAME = "edgeface_s_gamma_05"  # 3.65M params, ~14MB checkpoint (eval-proven: 0.9165)
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
