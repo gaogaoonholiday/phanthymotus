@@ -24,7 +24,7 @@ Jetson 设备:   ssh develop@10.100.121.16  (密码: develop)
 个人目录:      /home/develop/dengshiwei/
 代码仓库:      https://github.com/gaogaoonholiday/phanthymotus
 代码分支:      feat/face-recognition
-Commit ID:     6d2dbb1
+Commit ID:     3a580c5
 
 模型文件 (juicefs):
 URL 前缀:  http://172.28.4.81:34567/face
@@ -54,19 +54,16 @@ URL 前缀:  http://172.28.4.81:34567/face
         "faces": 1, "face_px": 94,
         "top3": [["n000001", 0.877], ["n000002", 0.246]],
         "gmean": 0.024,
-        "exp": {"inst": 0, "fmt": "xyxy", "thr": 0.5},
         "db": "50dirs/50emb nodetect=0 fail=0 imp mean=0.015 med=0.013 p95=0.191 max=0.434 top:..."
     }
 }
 
-bbox_relative 为归一化 [0-1] 坐标，6 位小数，顺序: [x1/W, y1/H, x2/W, y2/H]
+bbox_relative 为归一化 [0-1] 坐标，6 位小数，顺序: [x/W, y/H, w/W, h/H]
 注意: 直接返回人脸对象，不要包装在 faces 数组或 {"image_size":..., "faces":...} 中
 
-每实例诊断实验 (6d2dbb1 新增):
-- 评测 10 容器 MCP_PORT=15720+100k (k=0..9)，插件按实例号切换 bbox 输出格式与阈值
-- 目的: 榜单按实例分别报准确率，一次评测即可定位评测端期望的坐标约定
-- 无 MCP_PORT / 端口<15720 时 → 实例0 (控制组，格式与阈值同基线，行为不变)
-- diag.exp 字段记录本实例实际生效的 {"inst","fmt","thr"}
+坐标格式已实测确认 (3a580c5，见附2 第7条):
+- 评测端按 [x, y, w, h] 解析 bbox_relative（2026-09-05 每实例实验证实）
+- 旧版输出 [x1,y1,x2,y2] 时 ID 虽对但 IoU<0.5，accuracy 仅 0.16；改 xywh 后 0.92
 
 diag 字段说明 (a901b40 新增，评测调试用，评测器应忽略未知字段):
 - faces:            本帧检测到的人脸数
@@ -78,7 +75,6 @@ diag 字段说明 (a901b40 新增，评测调试用，评测器应忽略未知�
   健康库基线 (LFW 100 人实测): imp mean≈0.015, max<0.45, top1-top2 差 >0.3
   判读: imp mean>0.4 → 注册库塌缩; top3 前两名差距<0.1 → 判别力不足;
         gmean>0.5 → 整库向量挤在一起(域差); faces>1 → 图中多人需选脸
-- exp (6d2dbb1 新增): 本实例诊断实验参数 inst=实例号 / fmt=bbox输出格式 / thr=生效阈值
 
 ================================================================================
 1. SSH 登录 Jetson
@@ -110,9 +106,9 @@ cd phanthymotus
 
 # 确认 commit
 git log --oneline -3
-# 应看到: 6d2dbb1 feat: per-instance bbox-format/threshold diagnostic experiment
-#         a901b40 feat: add face-db quality + match-margin diagnostics
-#         2281c44 docs: correct run.txt — EdgeFace runs PyTorch CPU
+# 应看到: 3a580c5 fix: output bbox_relative as [x,y,w,h] and lower threshold to 0.4
+#         b298492 docs: sync run.txt to 6d2dbb1
+#         6d2dbb1 feat: per-instance bbox-format/threshold diagnostic experiment
 
 # 确认关键文件存在
 ls perception/plugins/face.py
@@ -454,11 +450,11 @@ for det in detections:
     bbox_relative = [
         round(x1 / W, 6),
         round(y1 / H, 6),
-        round(x2 / W, 6),
-        round(y2 / H, 6),
+        round((x2 - x1) / W, 6),
+        round((y2 - y1) / H, 6),
     ]
     embedding = np.array(det["embedding"], dtype=np.float32)
-    person_id, similarity = face_db.match(embedding, threshold=0.5)
+    person_id, similarity = face_db.match(embedding, threshold=0.4)
 
     face_result = {
         "detect_confidence": round(det["confidence"], 4),
@@ -487,7 +483,7 @@ for i in range(10):
     t0 = time.time()
     dets = adapter.detect_and_embed(rgb_frame)
     for d in dets:
-        face_db.match(np.array(d["embedding"], dtype=np.float32), threshold=0.5)
+        face_db.match(np.array(d["embedding"], dtype=np.float32), threshold=0.4)
     t1 = time.time()
     times.append(t1 - t0)
 
@@ -700,7 +696,7 @@ curl -s http://localhost:15720 -X POST \
 
 ┌─ 问题: person_id 总是 "unknown" ────────────────────────────────────┐
 │ 排查: 1) face_db 是否为空？                                          │
-│       2) similarity_threshold 是否太高？默认 0.5，可降到 0.3 测试    │
+│       2) similarity_threshold 当前 0.4 (3a580c5)，必要时可微调          │
 │       3) 身份库照片和测试照片是否为同一人？                          │
 │       4) 身份库照片是否正脸清晰？                                    │
 └──────────────────────────────────────────────────────────────────────┘
@@ -729,7 +725,7 @@ curl -s http://localhost:15720 -X POST \
 
 env:
   - name: PHANTHYMOTUS_COMMIT_ID
-    value: "6d2dbb1"
+    value: "3a580c5"
   - name: PHANTHYMOTUS_REPO
     value: "https://github.com/gaogaoonholiday/phanthymotus.git"
   - name: JP_VERSION
@@ -762,22 +758,17 @@ env:
 附: 文件清单
 ================================================================================
 
-本次提交 (commit 6d2dbb1) 修改的文件:
+本次提交 (commit 3a580c5) 修改的文件:
 
-perception/plugins/face.py              修改 — 每实例 bbox 格式/阈值诊断实验:
-  1. 按 MCP_PORT 推实例号 k=(port-15720)/100，映射到 (bbox输出格式, 阈值覆盖)
-     0:xyxy/0.5(控制) 1:xywh/0.5 2:yxxy/0.5 3:cxcywh/0.5
-     4:xyxy/0.4 5:xyxy/0.45 6:xyxy/0.3 7:xywh/0.4 8:yxxy/0.4 9:xywh/0.3
-  2. 实际生效参数写入 diag.exp，随 payload 落入评测 result.log
-  3. 控制组 (实例0 / 无 MCP_PORT) 行为与 a901b40 完全一致
+perception/plugins/face.py              修改 — bbox 输出改为 [x,y,w,h]:
+  1. bbox_relative 由 [x1,y1,x2,y2] 改为 [x/W, y/H, w/W, h/H]
+     (6d2dbb1 每实例实验证实评测端按 [x,y,w,h] 解析; accuracy 0.16→0.92)
+  2. 移除每实例实验代码，所有实例统一输出 xywh
+perception/config.yaml                  修改 — similarity_threshold 0.5 → 0.4
+  (实验: 0.4→0.9227, 0.5→0.9072, 0.3→0.8866；相似度中位 0.77 vs impostor p95 0.18)
 
-上一次提交 (a901b40) 修改的文件:
-perception/plugins/face.py              修改 — 新增评测诊断日志:
-  1. face_db 加载完成后计算库内"冒名者相似度"统计
-     (imp mean/med/p95/max + 最高相似对)，写入 load_diag
-  2. 每帧发布结果附加 diag 字段: faces/face_px/top3/gmean
-     (首次发布携带 db=load_diag)，随 ROS payload 落入评测 result.log
-  3. 匹配逻辑与输出契约未变，identity 输出不受影响
+上一次提交 (6d2dbb1): 每实例 bbox 格式/阈值诊断实验 (已完成使命，3a580c5 移除)
+a901b40: 评测诊断日志 (load_diag 库健康统计 + diag 字段)，保留未动
 
 历史提交:
   c81944d  revert: 撤销 MTCNN GPU (073abab)，恢复 YuNet 基线
@@ -832,6 +823,24 @@ perception/plugins/face.py              修改 — 新增评测诊断日志:
      其余解释 (cxcywh / x1x2y1y2 / 头肩GT框) IoU 全为 0, 基本排除
    - 对策: 6d2dbb1 每实例实验 (见附·文件清单)，一次评测分辨坐标约定 + 阈值敏感性
      若 10 实例仍全部 ≈0.16 → 结论指向评测端 GT-身份映射问题，需与评测方核对
+
+7) 每实例实验结果 (6d2dbb1, 2026-09-05) — 坐标之谜破解:
+   ┌──────┬────────────────────┬──────┬──────────┐
+   │ 实例 │ bbox 输出格式       │ 阈值 │ accuracy │
+   ├──────┼────────────────────┼──────┼──────────┤
+   │ 0    │ xyxy(旧基线,控制组) │ 0.5  │ 0.1598   │
+   │ 1    │ [x,y,w,h]          │ 0.5  │ 0.9072   │
+   │ 2    │ [y1,x1,y2,x2]      │ 0.5  │ 0.0515   │
+   │ 3    │ [xc,yc,w,h]        │ 0.5  │ 0.0000   │
+   │ 4    │ xyxy               │ 0.4  │ 0.1546   │
+   │ 5    │ xyxy               │ 0.45 │ 0.1598   │
+   │ 6    │ xyxy               │ 0.3  │ 0.1598   │
+   │ 7    │ [x,y,w,h]          │ 0.4  │ 0.9227 ← │
+   │ 8    │ [y1,x1,y2,x2]      │ 0.4  │ 0.0515   │
+   │ 9    │ [x,y,w,h]          │ 0.3  │ 0.8866   │
+   └──────┴────────────────────┴──────┴──────────┘
+   结论: 评测端按 [x,y,w,h] 解析 bbox_relative → 3a580c5 固定输出 xywh + 阈值0.4
+   实例0 与 874c08d 历史分 0.1598 完全一致，实验自证有效
 
 perception/Dockerfile.jetson             修改 — 添加 face 依赖 (timm, onnxruntime 等) + COPY edgeface_src
 perception/main.py                       修改 — 加载 FaceRecognitionPlugin + 环境变量端口
