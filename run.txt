@@ -24,14 +24,14 @@ Jetson 设备:   ssh develop@10.100.121.16  (密码: develop)
 个人目录:      /home/develop/dengshiwei/
 代码仓库:      https://github.com/gaogaoonholiday/phanthymotus
 代码分支:      feat/face-recognition
-Commit ID:     d3968b8
+Commit ID:     99531d0
 
 模型文件 (juicefs):
 URL 前缀:  http://172.28.4.81:34567/face
 本地挂载:  /mnt/data/face  (开发机上)
 文件列表:
-    edgeface_base.pt                72,972,261 bytes (~73MB)  ← 当前使用 (d3968b8)
-    edgeface_s_gamma_05.pt          14,695,737 bytes (~14MB)  ← 旧模型备份
+    edgeface_s_gamma_05.pt          14,695,737 bytes (~14MB)  ← 当前使用 (99531d0)
+    edgeface_base.pt                72,972,261 bytes (~73MB)  ← 已试验，评测分更低，备用
     edgeface_s_gamma_05.onnx        1,342,191 bytes (~1.3MB)
     face_detection_yunet_2023mar.onnx  232,589 bytes (~0.2MB)
 
@@ -107,9 +107,9 @@ cd phanthymotus
 
 # 确认 commit
 git log --oneline -3
-# 应看到: d3968b8 feat: switch embedding model to edgeface_base (18.23M params)
-#         baa4da0 docs: sync run.txt to 3a580c5
-#         3a580c5 fix: output bbox_relative as [x,y,w,h] and lower threshold to 0.4
+# 应看到: 99531d0 revert: edgeface_base -> s_gamma_05 (eval 0.9046 < 0.9165)
+#         b9b1d84 docs: sync run.txt to d3968b8
+#         d3968b8 feat: switch embedding model to edgeface_base (18.23M params)
 
 # 确认关键文件存在
 ls perception/plugins/face.py
@@ -726,7 +726,7 @@ curl -s http://localhost:15720 -X POST \
 
 env:
   - name: PHANTHYMOTUS_COMMIT_ID
-    value: "d3968b8"
+    value: "99531d0"
   - name: PHANTHYMOTUS_REPO
     value: "https://github.com/gaogaoonholiday/phanthymotus.git"
   - name: JP_VERSION
@@ -759,13 +759,15 @@ env:
 附: 文件清单
 ================================================================================
 
-本次提交 (commit d3968b8) 修改的文件:
+本次提交 (commit 99531d0) 修改的文件:
 
-perception/plugins/face.py              修改 — 默认模型 edgeface_s_gamma_05 → edgeface_base
-perception/config.yaml                  修改 — model: edgeface_base (阈值保持 0.4)
-  juicefs 新增 edgeface_base.pt (73MB, MD5 23750f0e...，容器按 {model}.pt 自动下载)
-  LFW 对比: base acc@0.4=0.9725 FA=1/64 (s_gamma_05: 0.9670 FA=3/64)，FA 曲线平坦更稳
-  延迟 p50 169→252ms，评测 FPS 预计 1.38→~1.0 (监控指标，主指标不受影响)
+perception/plugins/face.py              修改 — 默认模型回滚 edgeface_base → s_gamma_05
+perception/config.yaml                  修改 — model: edgeface_s_gamma_05 (阈值保持 0.4)
+  d3968b8 (base) 评测实测 0.9046 < s_gamma_05 的 0.9165，且慢实例出现 1-2 个失败 case
+  (延迟 1.7s / FPS 0.57)；LFW 增益未迁移，恢复评测已验证配置 (= tag eval-acc0.9165)
+  base 权重保留在 juicefs 备用
+
+上一次提交 (d3968b8): edgeface_base 试验 (评测 0.9046，已回滚)
 
 上一次提交 (3a580c5) 修改的文件:
 
@@ -867,6 +869,11 @@ a901b40: 评测诊断日志 (load_diag 库健康统计 + diag 字段)，保留�
    └──────────────────┴─────────────┴─────────────┘
    base 误接受曲线平坦 (0.3 仍 FA=1/64)，判别余量大、抗域漂移 → 选 base, 阈值保持 0.4
    权重: HF Idiap/EdgeFace-Base (MD5 23750f0e8598367c7662235402f7c504) → juicefs
+
+10) base 评测实测 (d3968b8, 2026-09-06 00:31): 平均 accuracy 0.9046 < s_gamma_05 0.9165
+    实例分 0.9021-0.9072；FPS 0.73，延迟 1.1-1.7s，慢实例失败率 0.0103 (1-2 case)
+    库内分离反而更好 (imp max=0.251) 但评测域正确匹配相似度整体下移 → 0.4 阈值下
+    below-thresh 已知人增多。结论: LFW 增益未迁移，评测域偏好 s_gamma_05，回滚
 
 perception/Dockerfile.jetson             修改 — 添加 face 依赖 (timm, onnxruntime 等) + COPY edgeface_src
 perception/main.py                       修改 — 加载 FaceRecognitionPlugin + 环境变量端口
