@@ -94,6 +94,6 @@ plugins:
                                 # CPU mode avoids CUDA context overhead for 10 containers
     model_dir: /models/face
     face_db_dir: /workspace/face_db
-    similarity_threshold: 0.5
+    similarity_threshold: 0.4    # 0.9227 @0.4 vs 0.9072 @0.5 vs 0.8866 @0.3 (2026-09-05 eval)
     confidence: 0.5
     fps: 3
