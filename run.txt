@@ -24,13 +24,14 @@ Jetson 设备:   ssh develop@10.100.121.16  (密码: develop)
 个人目录:      /home/develop/dengshiwei/
 代码仓库:      https://github.com/gaogaoonholiday/phanthymotus
 代码分支:      feat/face-recognition
-Commit ID:     3a580c5
+Commit ID:     d3968b8
 
 模型文件 (juicefs):
 URL 前缀:  http://172.28.4.81:34567/face
 本地挂载:  /mnt/data/face  (开发机上)
 文件列表:
-    edgeface_s_gamma_05.pt          14,695,737 bytes (~14MB)
+    edgeface_base.pt                72,972,261 bytes (~73MB)  ← 当前使用 (d3968b8)
+    edgeface_s_gamma_05.pt          14,695,737 bytes (~14MB)  ← 旧模型备份
     edgeface_s_gamma_05.onnx        1,342,191 bytes (~1.3MB)
     face_detection_yunet_2023mar.onnx  232,589 bytes (~0.2MB)
 
@@ -106,9 +107,9 @@ cd phanthymotus
 
 # 确认 commit
 git log --oneline -3
-# 应看到: 3a580c5 fix: output bbox_relative as [x,y,w,h] and lower threshold to 0.4
-#         b298492 docs: sync run.txt to 6d2dbb1
-#         6d2dbb1 feat: per-instance bbox-format/threshold diagnostic experiment
+# 应看到: d3968b8 feat: switch embedding model to edgeface_base (18.23M params)
+#         baa4da0 docs: sync run.txt to 3a580c5
+#         3a580c5 fix: output bbox_relative as [x,y,w,h] and lower threshold to 0.4
 
 # 确认关键文件存在
 ls perception/plugins/face.py
@@ -725,7 +726,7 @@ curl -s http://localhost:15720 -X POST \
 
 env:
   - name: PHANTHYMOTUS_COMMIT_ID
-    value: "3a580c5"
+    value: "d3968b8"
   - name: PHANTHYMOTUS_REPO
     value: "https://github.com/gaogaoonholiday/phanthymotus.git"
   - name: JP_VERSION
@@ -758,7 +759,15 @@ env:
 附: 文件清单
 ================================================================================
 
-本次提交 (commit 3a580c5) 修改的文件:
+本次提交 (commit d3968b8) 修改的文件:
+
+perception/plugins/face.py              修改 — 默认模型 edgeface_s_gamma_05 → edgeface_base
+perception/config.yaml                  修改 — model: edgeface_base (阈值保持 0.4)
+  juicefs 新增 edgeface_base.pt (73MB, MD5 23750f0e...，容器按 {model}.pt 自动下载)
+  LFW 对比: base acc@0.4=0.9725 FA=1/64 (s_gamma_05: 0.9670 FA=3/64)，FA 曲线平坦更稳
+  延迟 p50 169→252ms，评测 FPS 预计 1.38→~1.0 (监控指标，主指标不受影响)
+
+上一次提交 (3a580c5) 修改的文件:
 
 perception/plugins/face.py              修改 — bbox 输出改为 [x,y,w,h]:
   1. bbox_relative 由 [x1,y1,x2,y2] 改为 [x/W, y/H, w/W, h/H]
@@ -841,6 +850,23 @@ a901b40: 评测诊断日志 (load_diag 库健康统计 + diag 字段)，保留�
    └──────┴────────────────────┴──────┴──────────┘
    结论: 评测端按 [x,y,w,h] 解析 bbox_relative → 3a580c5 固定输出 xywh + 阈值0.4
    实例0 与 874c08d 历史分 0.1598 完全一致，实验自证有效
+
+8) 3a580c5 评测结果 (2026-09-05 22:18): 平均 accuracy 0.9165 (历史 0.1598→0.3454→0.9165)
+   实例1-3/5-9 均 0.9227 (硬顶), 实例0 0.8969, 实例4 0.8866 (1 case 失败)
+   剩余 ~7.7%: 真匹配被阈值卡 (sim 0.31-0.40) + unknown 误接受 + 多脸/小脸
+
+9) 模型升级对比 (d3968b8, LFW 300已知/64未知, YuNet+PyTorch CPU, 阈值扫描):
+   ┌──────────────────┬─────────────┬─────────────┐
+   │                  │ s_gamma_05  │ base (18.2M)│
+   ├──────────────────┼─────────────┼─────────────┤
+   │ acc@0.5          │ 0.9478      │ 0.9368      │
+   │ acc@0.4          │ 0.9670 FA=3 │ 0.9725 FA=1 │
+   │ acc@0.35         │ 0.9588 FA=7 │ 0.9780 FA=1 │
+   │ acc@0.3          │ 0.9313 FA=18│ 0.9780 FA=1 │
+   │ 延迟 p50/p95 ms  │ 169/281     │ 252/450     │
+   └──────────────────┴─────────────┴─────────────┘
+   base 误接受曲线平坦 (0.3 仍 FA=1/64)，判别余量大、抗域漂移 → 选 base, 阈值保持 0.4
+   权重: HF Idiap/EdgeFace-Base (MD5 23750f0e8598367c7662235402f7c504) → juicefs
 
 perception/Dockerfile.jetson             修改 — 添加 face 依赖 (timm, onnxruntime 等) + COPY edgeface_src
 perception/main.py                       修改 — 加载 FaceRecognitionPlugin + 环境变量端口
