@@ -1,6 +1,6 @@
 ================================================================================
 人脸识别插件 — Jetson 调试 & 测试操作手册
-EdgeFace (edgeface_s_gamma_05) + YuNet + ONNX Runtime
+EdgeFace (edgeface_s_gamma_05) + YuNet/SCRFD + ONNX Runtime
 ================================================================================
 
 目录：
@@ -24,16 +24,17 @@ Jetson 设备:   ssh develop@10.100.121.16  (密码: develop)
 个人目录:      /home/develop/dengshiwei/
 代码仓库:      https://github.com/gaogaoonholiday/phanthymotus
 代码分支:      feat/face-recognition
-Commit ID:     99531d0
+Commit ID:     1927e65
 
 模型文件 (juicefs):
 URL 前缀:  http://172.28.4.81:34567/face
 本地挂载:  /mnt/data/face  (开发机上)
 文件列表:
-    edgeface_s_gamma_05.pt          14,695,737 bytes (~14MB)  ← 当前使用 (99531d0)
+    edgeface_s_gamma_05.pt          14,695,737 bytes (~14MB)  ← 当前使用 (1927e65)
     edgeface_base.pt                72,972,261 bytes (~73MB)  ← 已试验，评测分更低，备用
     edgeface_s_gamma_05.onnx        1,342,191 bytes (~1.3MB)
-    face_detection_yunet_2023mar.onnx  232,589 bytes (~0.2MB)
+    face_detection_yunet_2023mar.onnx  232,589 bytes (~0.2MB)  ← detector=yunet 时使用
+    scrfd_500m_kps.onnx             2,524,817 bytes (~2.4MB)   ← detector=scrfd 时使用
 
 身份库结构 (face_db):
 /workspace/face_db/
@@ -107,9 +108,9 @@ cd phanthymotus
 
 # 确认 commit
 git log --oneline -3
-# 应看到: 99531d0 revert: edgeface_base -> s_gamma_05 (eval 0.9046 < 0.9165)
-#         b9b1d84 docs: sync run.txt to d3968b8
-#         d3968b8 feat: switch embedding model to edgeface_base (18.23M params)
+# 应看到: 1927e65 feat: add SCRFD-500M-KPS detector option (default yunet)
+#         13ae746 docs: sync run.txt to 99531d0
+#         99531d0 revert: edgeface_base -> s_gamma_05 (eval 0.9046 < 0.9165)
 
 # 确认关键文件存在
 ls perception/plugins/face.py
@@ -331,9 +332,10 @@ docker logs face-test 2>&1 | head -30
 
 # 应看到:
 #   FaceRecognitionPlugin loaded
-#   [face] plugin init: model=edgeface_s_gamma_05, device=cpu, face_db_dir=/workspace/face_db
+#   [face] plugin init: model=edgeface_s_gamma_05, device=cpu, detector=scrfd, face_db_dir=/workspace/face_db
 #   [face] EdgeFace loaded: edgeface_s_gamma_05, device=cpu   ← PyTorch 推理（无 ONNX 后端）
-#   [face] YuNet loaded, conf=0.5
+#   [face] SCRFD-500M-KPS loaded, conf=0.5                     ← detector=scrfd 时
+#   [face] YuNet loaded, conf=0.5                              ← detector=yunet 时
 #   [face] face db loaded: N persons, M embeddings
 
 # ── 6.2 MCP 工具列表 ──
@@ -360,8 +362,9 @@ docker logs face-test 2>&1 | grep "\[face\]"
 # 应看到:
 #   [face] downloading edgeface_s_gamma_05.pt from http://172.28.4.81:34567/...
 #   [face] download complete: /models/face/edgeface_s_gamma_05.pt (14.7 MB)
+#   [face] downloading scrfd_500m_kps.onnx from http://172.28.4.81:34567/...   (detector=scrfd)
 #   [face] EdgeFace loaded: edgeface_s_gamma_05, device=cpu
-#   [face] YuNet loaded, conf=0.5
+#   [face] SCRFD-500M-KPS loaded, conf=0.5
 #   [face] face db loaded: N persons, M embeddings
 #   [face][diag] db: 50dirs/50emb nodetect=0 fail=0 imp mean=0.015 ...
 
@@ -726,7 +729,7 @@ curl -s http://localhost:15720 -X POST \
 
 env:
   - name: PHANTHYMOTUS_COMMIT_ID
-    value: "99531d0"
+    value: "1927e65"
   - name: PHANTHYMOTUS_REPO
     value: "https://github.com/gaogaoonholiday/phanthymotus.git"
   - name: JP_VERSION
@@ -759,8 +762,23 @@ env:
 附: 文件清单
 ================================================================================
 
-本次提交 (commit 99531d0) 修改的文件:
+本次提交 (commit 1927e65) 修改的文件:
 
+perception/plugins/face.py              修改 — 新增 detector: yunet|scrfd 可配置检测器:
+  1. 新增 YuNetDetector / SCRFDDetector 两个检测器封装，统一输出原图坐标
+     {bbox:[x1,y1,x2,y2], landmarks:[5x2], confidence}
+  2. SCRFD-500M-KPS 走 onnxruntime CPU，insightface 精确后处理
+     (strides 8/16/32, num_anchors=2, bbox/kps × stride, top-left letterbox,
+      blobFromImage 1/128 mean 127.5 swapRB=True → 输入 BGR)
+  3. _ensure_weights 按 detector 下载对应 ONNX (yunet/scrfd)
+  4. detect_and_embed 统一: 检测器返回原图坐标 → 原图全分辨率 warpAffine 对齐
+     (旧版在 1280 缩略图上对齐，行为等价但新方案用全分辨率插值，更优)
+  5. onnxruntime 懒加载，仅 detector=scrfd 时 import；强制 CPUExecutionProvider
+perception/config.yaml                  修改 — detector: scrfd (yunet 仍为代码默认，可回退)
+  动机: LFW 上 SCRFD 比 YuNet 更差 (0.9396 vs 0.9615 @0.4，且检测更慢 75ms vs 34ms)，
+  但评测域与 LFW 分布不一致 (base 模型 LFW 赢却评测输)，故切到 scrfd 做平台实测
+
+上一次提交 (99531d0): 默认模型回滚 edgeface_base → s_gamma_05
 perception/plugins/face.py              修改 — 默认模型回滚 edgeface_base → s_gamma_05
 perception/config.yaml                  修改 — model: edgeface_s_gamma_05 (阈值保持 0.4)
   d3968b8 (base) 评测实测 0.9046 < s_gamma_05 的 0.9165，且慢实例出现 1-2 个失败 case
@@ -874,6 +892,16 @@ a901b40: 评测诊断日志 (load_diag 库健康统计 + diag 字段)，保留�
     实例分 0.9021-0.9072；FPS 0.73，延迟 1.1-1.7s，慢实例失败率 0.0103 (1-2 case)
     库内分离反而更好 (imp max=0.251) 但评测域正确匹配相似度整体下移 → 0.4 阈值下
     below-thresh 已知人增多。结论: LFW 增益未迁移，评测域偏好 s_gamma_05，回滚
+
+11) SCRFD-500M-KPS LFW 对比 (jetson_scrfd_compare.py, 2026-09-06):
+    ┌────────────────────┬────────┬───────────────┬───────────┐
+    │ 检测器              │ acc@0.4│ 检测 p50 (ms) │ 漏检已知  │
+    ├────────────────────┼────────┼───────────────┼───────────┤
+    │ YuNet              │ 0.9615 │ 34            │ 0         │
+    │ SCRFD-500M-KPS     │ 0.9396 │ 75            │ 1         │
+    └────────────────────┴────────┴───────────────┴───────────┘
+    SCRFD 在 LFW 上更差 (1 例已知漏检 + 更慢)，但评测域分布与 LFW 不一致，
+    故仍按用户指示切 detector=scrfd 做平台实测 (commit 1927e65)。
 
 perception/Dockerfile.jetson             修改 — 添加 face 依赖 (timm, onnxruntime 等) + COPY edgeface_src
 perception/main.py                       修改 — 加载 FaceRecognitionPlugin + 环境变量端口
