@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-plugins/face.py — FaceRecognitionPlugin: EdgeFace + YuNet face recognition.
+plugins/face.py — FaceRecognitionPlugin: EdgeFace + (YuNet|SCRFD) face recognition.
 
 Pipeline: CompressedImage → YuNet detect → align (112×112) → EdgeFace embed → identity match
 Downloads weights from juicefs (http://172.28.4.81:34567/).
@@ -81,7 +81,7 @@ TOOLS = [
         "name": "face",
         "type": "processor",
         "multiInstance": True,
-        "description": "Face Recognition — detect and identify faces using EdgeFace + YuNet",
+        "description": "Face Recognition — detect and identify faces using EdgeFace + YuNet/SCRFD",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -104,6 +104,13 @@ TOOLS = [
                     "type": "string",
                     "description": "EdgeFace model name",
                     "default": DEFAULT_MODEL_NAME,
+                    "scope": "shared",
+                },
+                "detector": {
+                    "type": "string",
+                    "enum": ["yunet", "scrfd"],
+                    "description": "Face detector: yunet (proven default) or scrfd-500m-kps",
+                    "default": "yunet",
                     "scope": "shared",
                 },
                 "face_db_dir": {
@@ -153,7 +160,7 @@ TOOLS = [
 
 # ── Model download ────────────────────────────────────────────────────────────
 
-def _ensure_weights(model_name: str, model_dir: str) -> str:
+def _ensure_weights(model_name: str, model_dir: str, detector: str = "yunet") -> str:
     """Download model weights from juicefs if not present. Returns checkpoint path."""
     os.makedirs(model_dir, exist_ok=True)
 
@@ -166,14 +173,17 @@ def _ensure_weights(model_name: str, model_dir: str) -> str:
         urllib.request.urlretrieve(url, ckpt_path)
         log.info(f"[face] download complete: {ckpt_path} ({os.path.getsize(ckpt_path) / 1e6:.1f} MB)")
 
-    # YuNet ONNX model
-    yunet_filename = "face_detection_yunet_2023mar.onnx"
-    yunet_path = os.path.join(model_dir, yunet_filename)
-    if not os.path.exists(yunet_path):
-        url = f"{_MODEL_BASE_URL}/{yunet_filename}"
-        log.info(f"[face] downloading {yunet_filename} from {url}")
-        urllib.request.urlretrieve(url, yunet_path)
-        log.info(f"[face] download complete: {yunet_path} ({os.path.getsize(yunet_path) / 1e6:.1f} MB)")
+    # Detector ONNX model
+    det_filename = {
+        "yunet": "face_detection_yunet_2023mar.onnx",
+        "scrfd": "scrfd_500m_kps.onnx",
+    }.get(detector, "face_detection_yunet_2023mar.onnx")
+    det_path = os.path.join(model_dir, det_filename)
+    if not os.path.exists(det_path):
+        url = f"{_MODEL_BASE_URL}/{det_filename}"
+        log.info(f"[face] downloading {det_filename} from {url}")
+        urllib.request.urlretrieve(url, det_path)
+        log.info(f"[face] download complete: {det_path} ({os.path.getsize(det_path) / 1e6:.1f} MB)")
 
     return ckpt_path
 
@@ -320,7 +330,7 @@ class FaceDatabase:
             return sum(len(v) for v in self._embeddings.values())
 
 
-# ── EdgeFace + YuNet Adapter ──────────────────────────────────────────────────
+# ── EdgeFace + Detector Adapter ──────────────────────────────────────────────
 
 # ArcFace 5-point reference for 112×112 alignment
 _ARCFACE_REF = np.array([
@@ -331,12 +341,176 @@ _ARCFACE_REF = np.array([
 # Resize input to this width for detection (speed/accuracy trade-off)
 _DETECT_TARGET_W = 1280
 
+# SCRFD-500M-KPS postprocess constants (matches insightface model_zoo/scrfd.py)
+_SCRFD_STRIDES = [8, 16, 32]
+_SCRFD_NUM_ANCHORS = 2
+
+
+def _distance2bbox(points, distance):
+    x1 = points[:, 0] - distance[:, 0]
+    y1 = points[:, 1] - distance[:, 1]
+    x2 = points[:, 0] + distance[:, 2]
+    y2 = points[:, 1] + distance[:, 3]
+    return np.stack([x1, y1, x2, y2], axis=-1)
+
+
+def _distance2kps(points, distance):
+    preds = []
+    for i in range(0, distance.shape[1], 2):
+        preds.append(points[:, 0] + distance[:, i])
+        preds.append(points[:, 1] + distance[:, i + 1])
+    return np.stack(preds, axis=-1)
+
+
+class YuNetDetector:
+    """OpenCV FaceDetectorYN wrapper. Expects RGB input, returns original-coord detections."""
+
+    def __init__(self, model_dir: str, confidence: float):
+        import cv2
+        yunet_path = os.path.join(model_dir, "face_detection_yunet_2023mar.onnx")
+        self._det = cv2.FaceDetectorYN_create(
+            yunet_path, "", (320, 320),
+            score_threshold=confidence,
+            nms_threshold=0.3,
+            top_k=5000,
+        )
+        self._confidence = confidence
+
+    def detect(self, image_rgb: np.ndarray) -> list[dict]:
+        import cv2
+        H, W = image_rgb.shape[:2]
+        if W > _DETECT_TARGET_W:
+            scale = _DETECT_TARGET_W / W
+            new_w, new_h = _DETECT_TARGET_W, int(H * scale)
+            img = cv2.resize(image_rgb, (new_w, new_h))
+        else:
+            scale = 1.0
+            new_w, new_h = W, H
+            img = image_rgb
+
+        self._det.setInputSize((new_w, new_h))
+        _, faces = self._det.detect(img)
+
+        out = []
+        if faces is None:
+            return out
+        for f in faces:
+            if f[14] < self._confidence:
+                continue
+            x, y, w, h = float(f[0]), float(f[1]), float(f[2]), float(f[3])
+            landmarks = np.array([
+                [f[4], f[5]], [f[6], f[7]], [f[8], f[9]],
+                [f[10], f[11]], [f[12], f[13]],
+            ], dtype=np.float32)
+            out.append({
+                "bbox": [x / scale, y / scale, (x + w) / scale, (y + h) / scale],
+                "landmarks": landmarks / scale,
+                "confidence": float(f[14]),
+            })
+        return out
+
+
+class SCRFDDetector:
+    """SCRFD-500M-KPS via onnxruntime. Expects RGB input (converts to BGR internally),
+    returns original-coord detections."""
+
+    def __init__(self, model_dir: str, confidence: float):
+        import onnxruntime as ort
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = 4
+        model_path = os.path.join(model_dir, "scrfd_500m_kps.onnx")
+        self._sess = ort.InferenceSession(
+            model_path, sess_options=so, providers=["CPUExecutionProvider"]
+        )
+        self._input_name = self._sess.get_inputs()[0].name
+        self._confidence = confidence
+        self._cache = {}
+
+    def _forward(self, det_img, thresh):
+        import cv2
+        H, W = det_img.shape[:2]
+        blob = cv2.dnn.blobFromImage(
+            det_img, 1.0 / 128.0, (W, H), (127.5, 127.5, 127.5), swapRB=True
+        )
+        out = self._sess.run(None, {self._input_name: blob})
+        s_list, b_list, k_list = [], [], []
+        for idx, stride in enumerate(_SCRFD_STRIDES):
+            scores = out[idx]
+            bbox_preds = out[idx + 3] * stride
+            kps_preds = out[idx + 6] * stride
+            h, w = H // stride, W // stride
+            key = (h, w, stride)
+            if key in self._cache:
+                anchor = self._cache[key]
+            else:
+                anchor = np.stack(np.mgrid[:h, :w][::-1], axis=-1).astype(np.float32)
+                anchor = (anchor * stride).reshape(-1, 2)
+                anchor = np.stack([anchor] * _SCRFD_NUM_ANCHORS, axis=1).reshape(-1, 2)
+                if len(self._cache) < 100:
+                    self._cache[key] = anchor
+            pos = np.where(scores >= thresh)[0]
+            b_list.append(_distance2bbox(anchor, bbox_preds)[pos])
+            k_list.append(_distance2kps(anchor, kps_preds)[pos].reshape(-1, 5, 2))
+            s_list.append(scores[pos])
+        return s_list, b_list, k_list
+
+    def detect(self, image_rgb: np.ndarray, input_size=(640, 640)) -> list[dict]:
+        import cv2
+        bgr = image_rgb[:, :, ::-1]
+        im_ratio = bgr.shape[0] / bgr.shape[1]
+        model_ratio = input_size[1] / input_size[0]
+        if im_ratio > model_ratio:
+            new_h = input_size[1]
+            new_w = int(new_h / im_ratio)
+        else:
+            new_w = input_size[0]
+            new_h = int(new_w * im_ratio)
+        det_scale = new_h / bgr.shape[0]
+        resized = cv2.resize(bgr, (new_w, new_h))
+        det_img = np.zeros((input_size[1], input_size[0], 3), dtype=np.uint8)
+        det_img[:new_h, :new_w, :] = resized
+
+        s, b, k = self._forward(det_img, self._confidence)
+        if not s or sum(x.size for x in s) == 0:
+            return []
+        scores = np.vstack(s).ravel()
+        boxes = np.vstack(b) / det_scale
+        kpss = np.vstack(k) / det_scale
+        order = scores.argsort()[::-1]
+        scores, boxes, kpss = scores[order], boxes[order], kpss[order]
+
+        # NMS
+        x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        areas = (x2 - x1) * (y2 - y1)
+        keep = []
+        idx = np.arange(len(scores))
+        while idx.size > 0:
+            i = idx[0]
+            keep.append(i)
+            if idx.size == 1:
+                break
+            xx1 = np.maximum(x1[i], x1[idx[1:]])
+            yy1 = np.maximum(y1[i], y1[idx[1:]])
+            xx2 = np.minimum(x2[i], x2[idx[1:]])
+            yy2 = np.minimum(y2[i], y2[idx[1:]])
+            w = np.maximum(0.0, xx2 - xx1)
+            h = np.maximum(0.0, yy2 - yy1)
+            iou = (w * h) / (areas[i] + areas[idx[1:]] - w * h)
+            idx = idx[1:][iou <= 0.4]
+        keep = np.array(keep, dtype=int)
+        return [{
+            "bbox": boxes[i],
+            "landmarks": kpss[i],
+            "confidence": float(scores[i]),
+        } for i in keep]
+
 
 class EdgeFaceAdapter:
-    """YuNet face detection + EdgeFace embedding extraction.
+    """Face detection (YuNet or SCRFD) + EdgeFace embedding extraction.
 
-    YuNet (OpenCV FaceDetectorYN) is a single-stage detector — no image pyramid,
-    ~250ms on CPU for 1280px. EdgeFace runs on CPU (~189ms) or GPU (~26ms).
+    YuNet (OpenCV FaceDetectorYN) is the proven default — ~250ms on CPU for 1280px.
+    SCRFD-500M-KPS (onnxruntime) is an alternative detector for domain-shift testing.
+    EdgeFace runs on CPU (~189ms) or GPU (~26ms).
     Model weights are auto-downloaded from juicefs.
 
     device='cpu':  ~440ms/frame, ~2.3 fps, no CUDA context — safe for 10 containers
@@ -344,7 +518,7 @@ class EdgeFaceAdapter:
     """
 
     def __init__(self, model_name: str, model_dir: str, device: str = "cpu",
-                 confidence: float = 0.5):
+                 confidence: float = 0.5, detector: str = "yunet"):
         import torch
         from torchvision import transforms
 
@@ -354,7 +528,7 @@ class EdgeFaceAdapter:
         torch.set_num_threads(1)
 
         # Download weights from juicefs
-        ckpt_path = _ensure_weights(model_name, model_dir)
+        ckpt_path = _ensure_weights(model_name, model_dir, detector=detector)
 
         # ── Load EdgeFace backbone ──
         from backbones import get_model
@@ -366,17 +540,14 @@ class EdgeFaceAdapter:
         self._model.to(self._device).eval()
         log.info(f"[face] EdgeFace loaded: {model_name}, device={self._device}")
 
-        # ── YuNet detector (OpenCV ONNX) ──
-        import cv2
-        yunet_path = os.path.join(model_dir, "face_detection_yunet_2023mar.onnx")
-        self._detector = cv2.FaceDetectorYN_create(
-            yunet_path, "", (320, 320),
-            score_threshold=confidence,
-            nms_threshold=0.3,
-            top_k=5000,
-        )
+        # ── Face detector ──
         self._confidence = confidence
-        log.info(f"[face] YuNet loaded, conf={confidence}")
+        if detector == "scrfd":
+            self._detector = SCRFDDetector(model_dir, confidence)
+            log.info(f"[face] SCRFD-500M-KPS loaded, conf={confidence}")
+        else:
+            self._detector = YuNetDetector(model_dir, confidence)
+            log.info(f"[face] YuNet loaded, conf={confidence}")
 
         # ── Preprocessing transform (same as training) ──
         self._transform = transforms.Compose([
@@ -400,41 +571,15 @@ class EdgeFaceAdapter:
         import torch
         from PIL import Image
 
-        H_orig, W_orig = image.shape[:2]
-
-        # ── Resize for detection (speed) ──
-        if W_orig > _DETECT_TARGET_W:
-            scale = _DETECT_TARGET_W / W_orig
-            new_h, new_w = int(H_orig * scale), _DETECT_TARGET_W
-            img_det = cv2.resize(image, (new_w, new_h))
-        else:
-            scale = 1.0
-            new_h, new_w = H_orig, W_orig
-            img_det = image
-
-        # YuNet expects (W, H) for setInputSize
-        self._detector.setInputSize((new_w, new_h))
-        _, faces = self._detector.detect(img_det)
-
-        if faces is None:
-            return []
+        detections = self._detector.detect(image)
 
         results = []
-        for f in faces:
-            if f[14] < self._confidence:
-                continue
-
-            # 5 landmarks: right_eye, left_eye, nose, right_mouth, left_mouth
-            landmarks = np.array([
-                [f[4], f[5]], [f[6], f[7]], [f[8], f[9]],
-                [f[10], f[11]], [f[12], f[13]],
-            ], dtype=np.float32)
-
-            # Affine align to 112×112
-            M = cv2.estimateAffinePartial2D(landmarks, _ARCFACE_REF)[0]
+        for det in detections:
+            # Affine align to 112×112 using 5 landmarks (original-coord)
+            M = cv2.estimateAffinePartial2D(det["landmarks"], _ARCFACE_REF)[0]
             if M is None:
                 continue
-            aligned = cv2.warpAffine(img_det, M, (112, 112), borderValue=0)
+            aligned = cv2.warpAffine(image, M, (112, 112), borderValue=0)
 
             # EdgeFace embedding
             tensor = self._transform(Image.fromarray(aligned)).unsqueeze(0).to(self._device)
@@ -442,14 +587,10 @@ class EdgeFaceAdapter:
                 embedding = self._model(tensor)
             embedding = embedding.cpu().numpy().flatten()
 
-            # Scale bbox back to original resolution
-            x, y, w, h = float(f[0]), float(f[1]), float(f[2]), float(f[3])
-            bbox = [x / scale, y / scale, (x + w) / scale, (y + h) / scale]
-
             results.append({
                 "embedding": embedding,
-                "bbox": bbox,
-                "confidence": float(f[14]),
+                "bbox": det["bbox"],
+                "confidence": det["confidence"],
             })
 
         return results
@@ -602,6 +743,7 @@ class FaceRecognitionPlugin:
         self._executor = executor
         self._model_name = plugin_cfg.get("model", DEFAULT_MODEL_NAME)
         self._device = plugin_cfg.get("device", "cpu")
+        self._detector = plugin_cfg.get("detector", "yunet")
         self._face_db_dir = plugin_cfg.get("face_db_dir") or os.getenv("FACE_DB_DIR", "/workspace/face_db")
         self._model_dir = plugin_cfg.get("model_dir", "/models/face")
         self._similarity_threshold = float(plugin_cfg.get("similarity_threshold", DEFAULT_SIMILARITY_THRESHOLD))
@@ -619,7 +761,7 @@ class FaceRecognitionPlugin:
         self._instance_configs: dict[str, dict] = {}
 
         log.info(f"[face] plugin init: model={self._model_name}, device={self._device}, "
-                 f"face_db_dir={self._face_db_dir}")
+                 f"detector={self._detector}, face_db_dir={self._face_db_dir}")
 
         # Pre-load model at startup so it's ready before evaluation calls start.
         # The benchmark calls start then immediately publishes images; if the model
@@ -658,7 +800,7 @@ class FaceRecognitionPlugin:
 
             self._model = EdgeFaceAdapter(
                 self._model_name, self._model_dir, self._device,
-                confidence=self._confidence,
+                confidence=self._confidence, detector=self._detector,
             )
 
             # Load identity library
@@ -728,7 +870,7 @@ class FaceRecognitionPlugin:
                 "instances": instances,
                 "topic_in": topics_in,
                 "topic_out": topics_out,
-                "desc": "EdgeFace + YuNet face recognition",
+                "desc": f"EdgeFace + {self._detector} face recognition",
             }
 
         elif action == "start":
@@ -789,6 +931,8 @@ class FaceRecognitionPlugin:
             else:
                 if "model" in cfg:
                     self._model_name = cfg["model"]
+                if "detector" in cfg:
+                    self._detector = cfg["detector"]
                 if "device" in cfg:
                     self._device = cfg["device"]
                 if "face_db_dir" in cfg:
