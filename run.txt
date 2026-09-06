@@ -24,13 +24,13 @@ Jetson 设备:   ssh develop@10.100.121.16  (密码: develop)
 个人目录:      /home/develop/dengshiwei/
 代码仓库:      https://github.com/gaogaoonholiday/phanthymotus
 代码分支:      feat/face-recognition
-Commit ID:     1927e65
+Commit ID:     5ec227f
 
 模型文件 (juicefs):
 URL 前缀:  http://172.28.4.81:34567/face
 本地挂载:  /mnt/data/face  (开发机上)
 文件列表:
-    edgeface_s_gamma_05.pt          14,695,737 bytes (~14MB)  ← 当前使用 (1927e65)
+    edgeface_s_gamma_05.pt          14,695,737 bytes (~14MB)  ← 当前使用 (5ec227f)
     edgeface_base.pt                72,972,261 bytes (~73MB)  ← 已试验，评测分更低，备用
     edgeface_s_gamma_05.onnx        1,342,191 bytes (~1.3MB)
     face_detection_yunet_2023mar.onnx  232,589 bytes (~0.2MB)  ← detector=yunet 时使用
@@ -108,9 +108,9 @@ cd phanthymotus
 
 # 确认 commit
 git log --oneline -3
-# 应看到: 1927e65 feat: add SCRFD-500M-KPS detector option (default yunet)
-#         13ae746 docs: sync run.txt to 99531d0
-#         99531d0 revert: edgeface_base -> s_gamma_05 (eval 0.9046 < 0.9165)
+# 应看到: 5ec227f fix: install onnxruntime for SCRFD detector
+#         1ff2fcd docs: sync run.txt to 1927e65
+#         1927e65 feat: add SCRFD-500M-KPS detector option (default yunet)
 
 # 确认关键文件存在
 ls perception/plugins/face.py
@@ -729,7 +729,7 @@ curl -s http://localhost:15720 -X POST \
 
 env:
   - name: PHANTHYMOTUS_COMMIT_ID
-    value: "1927e65"
+    value: "5ec227f"
   - name: PHANTHYMOTUS_REPO
     value: "https://github.com/gaogaoonholiday/phanthymotus.git"
   - name: JP_VERSION
@@ -762,8 +762,14 @@ env:
 附: 文件清单
 ================================================================================
 
-本次提交 (commit 1927e65) 修改的文件:
+本次提交 (commit 5ec227f) 修改的文件:
 
+perception/Dockerfile.jetson             修改 — 显式安装 CPU 版 onnxruntime==1.18.1
+  修复 1927e65 平台失败: SCRFDDetector import onnxruntime 失败 (感知镜像此前没有
+  onnxruntime Python 包，sherpa-onnx 只打包共享库，rapidocr --no-deps 不引入)，
+  → state=error，194 case 全 None。1.18.1 是 cp38/cp310 双 ABI 最后一个 aarch64 版本。
+
+上一次提交 (1927e65): SCRFD-500M-KPS 可配置检测器 (平台实测因缺 onnxruntime 失败，见附2 第12条)
 perception/plugins/face.py              修改 — 新增 detector: yunet|scrfd 可配置检测器:
   1. 新增 YuNetDetector / SCRFDDetector 两个检测器封装，统一输出原图坐标
      {bbox:[x1,y1,x2,y2], landmarks:[5x2], confidence}
@@ -903,7 +909,19 @@ a901b40: 评测诊断日志 (load_diag 库健康统计 + diag 字段)，保留�
     SCRFD 在 LFW 上更差 (1 例已知漏检 + 更慢)，但评测域分布与 LFW 不一致，
     故仍按用户指示切 detector=scrfd 做平台实测 (commit 1927e65)。
 
-perception/Dockerfile.jetson             修改 — 添加 face 依赖 (timm, onnxruntime 等) + COPY edgeface_src
+12) SCRFD 平台实测 (1927e65, 2026-09-07 00:05) — 失败, 根因 onnxruntime 缺失:
+    评测日志显示 face 工具 start 返回 state=error，194 个 case 全部 pred_person_id=None，
+    单个 case 120s 超时。根因: 1927e65 的 SCRFDDetector 里 `import onnxruntime`，
+    但感知镜像没有 onnxruntime Python 包。sherpa-onnx 把 onnxruntime 作为共享库
+    打包在 sherpa_onnx/lib/ 下，不暴露顶层 onnxruntime 模块；rapidocr 特意
+    --no-deps 安装正是为了不引入 onnxruntime。因此模型加载抛 ImportError，
+    _model_load_error 被置位 → state=error。
+    修复 (5ec227f): Dockerfile 显式安装 CPU 版 onnxruntime==1.18.1
+    (cp38 jp5.11 / cp310 jp6.1 双 ABI 的最后一个版本，与 sherpa-onnx 钉版一致)，
+    CPU provider 以避免 10 容器 CUDA 上下文 OOM。需重新提交评测。
+
+perception/Dockerfile.jetson             修改 — 添加 face 依赖 (timm 等) + COPY edgeface_src;
+                                        5ec227f 补装 onnxruntime==1.18.1 (SCRFD 检测器运行时依赖)
 perception/main.py                       修改 — 加载 FaceRecognitionPlugin + 环境变量端口
 perception/deploy/service.yml            修改 — FastDDS XML 配置
 perception/config/fastdds_large_message.xml  新增 — UDPv4 大消息传输配置
