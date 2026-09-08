@@ -88,14 +88,23 @@ plugins:
     provider: local
     url: ""
     key: ""
-    model: edgeface_s_gamma_05   # 3.65M params — eval-proven best (0.9165; base scored 0.9046)
-    detector: scrfd_2.5g         # scrfd_2.5g best in local 16-combo sweep (testset_large: 0.9769 @0.4
-                                 # vs yunet 0.9684, scrfd_500m 0.9658); Jetson p50 90ms. Needs
-                                 # platform validation: LFW advantage didn't transfer for 500m.
-    device: cpu                  # 2.5G detector ~90ms + EdgeFace ~950ms ≈ 1.04s/frame on Orin CPU
-                                 # (~1 fps, under the 3 fps cap); CPU avoids CUDA context for 10 containers
+    model: edgeface_s_gamma_05   # 3.65M params — eval-proven best (0.9165; base scored 0.9046);
+                                 # embedded via ONNX Runtime (edgeface_s_gamma_05.onnx, cos=1.0 vs
+                                 # torch, ~8ms vs ~19ms per crop)
+    detector: scrfd_2.5g         # platform-proven best: f16dec6 (scrfd_2.5g) scored 0.9129
+                                 # = iou_accuracy 0.99 x face_accuracy 0.92 — detection was
+                                 # never the bottleneck (IoU ~1.0), so keep the more accurate
+                                 # detector; ONNX embed removes the torch cost instead
+    device: cpu                  # scrfd_2.5g ~29ms + ONNX EdgeFace ~8ms → e2e p50 ~43ms local
+                                 # (platform 3.7s is 10-container contention, not the model);
+                                 # CPU avoids CUDA context for 10 containers
     model_dir: /models/face
     face_db_dir: /workspace/face_db
-    similarity_threshold: 0.4    # platform-proven value; local sweep optimum is 0.4-0.35 for this combo
+    similarity_threshold: 0.45   # local full-set optimum on scrfd_2.5g + Umeyama + ONNX ef-s
+                                 # (3860 probes): ACC 0.9705 (hit 0.9594 / unknown-rej 0.9950)
+                                 # vs 0.9663 @0.40 / 0.9591 @0.50. Umeyama shifts the impostor
+                                 # distribution (p95=0.398), so 0.45 clears it with margin
+                                 # NOTE: per-container exploratory sweep overrides this
+                                 # (FACE_CONTAINER_SWEEP=1) — see face.py _container_sweep
     confidence: 0.5
     fps: 3

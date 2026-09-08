@@ -337,7 +337,6 @@ WORKDIR /work
 COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
-COPY perception/edgeface_src/ /work/edgeface_src/
 COPY perception/config.yaml /work/config.yaml
 COPY perception/config/    /work/config/
 COPY perception/deploy/    /deploy/
