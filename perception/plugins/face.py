@@ -108,8 +108,8 @@ TOOLS = [
                 },
                 "detector": {
                     "type": "string",
-                    "enum": ["yunet", "scrfd"],
-                    "description": "Face detector: yunet (proven default) or scrfd-500m-kps",
+                    "enum": ["yunet", "scrfd", "scrfd_2.5g"],
+                    "description": "Face detector: yunet (proven default) or scrfd-500m/2.5g-kps",
                     "default": "yunet",
                     "scope": "shared",
                 },
@@ -177,6 +177,7 @@ def _ensure_weights(model_name: str, model_dir: str, detector: str = "yunet") ->
     det_filename = {
         "yunet": "face_detection_yunet_2023mar.onnx",
         "scrfd": "scrfd_500m_kps.onnx",
+        "scrfd_2.5g": "scrfd_2.5g_bnkps_hsuyabc.onnx",
     }.get(detector, "face_detection_yunet_2023mar.onnx")
     det_path = os.path.join(model_dir, det_filename)
     if not os.path.exists(det_path):
@@ -411,14 +412,15 @@ class YuNetDetector:
 
 
 class SCRFDDetector:
-    """SCRFD-500M-KPS via onnxruntime. Expects RGB input (converts to BGR internally),
-    returns original-coord detections."""
+    """SCRFD-KPS (500M/2.5G) via onnxruntime. Expects RGB input (converts to BGR
+    internally), returns original-coord detections."""
 
-    def __init__(self, model_dir: str, confidence: float):
+    def __init__(self, model_dir: str, confidence: float,
+                 filename: str = "scrfd_500m_kps.onnx"):
         import onnxruntime as ort
         so = ort.SessionOptions()
         so.intra_op_num_threads = 4
-        model_path = os.path.join(model_dir, "scrfd_500m_kps.onnx")
+        model_path = os.path.join(model_dir, filename)
         self._sess = ort.InferenceSession(
             model_path, sess_options=so, providers=["CPUExecutionProvider"]
         )
@@ -433,11 +435,14 @@ class SCRFDDetector:
             det_img, 1.0 / 128.0, (W, H), (127.5, 127.5, 127.5), swapRB=True
         )
         out = self._sess.run(None, {self._input_name: blob})
+        # Model variants differ in output naming/batch dims (500m: numeric names,
+        # 2.5g: score_8/... with leading batch dim) — normalize all to 2D.
+        outs = [np.asarray(o).reshape(-1, np.asarray(o).shape[-1]) for o in out]
         s_list, b_list, k_list = [], [], []
         for idx, stride in enumerate(_SCRFD_STRIDES):
-            scores = out[idx]
-            bbox_preds = out[idx + 3] * stride
-            kps_preds = out[idx + 6] * stride
+            scores = outs[idx]
+            bbox_preds = outs[idx + 3] * stride
+            kps_preds = outs[idx + 6] * stride
             h, w = H // stride, W // stride
             key = (h, w, stride)
             if key in self._cache:
@@ -448,10 +453,10 @@ class SCRFDDetector:
                 anchor = np.stack([anchor] * _SCRFD_NUM_ANCHORS, axis=1).reshape(-1, 2)
                 if len(self._cache) < 100:
                     self._cache[key] = anchor
-            pos = np.where(scores >= thresh)[0]
+            pos = np.where(scores[:, 0] >= thresh)[0]
             b_list.append(_distance2bbox(anchor, bbox_preds)[pos])
             k_list.append(_distance2kps(anchor, kps_preds)[pos].reshape(-1, 5, 2))
-            s_list.append(scores[pos])
+            s_list.append(scores[pos, 0])
         return s_list, b_list, k_list
 
     def detect(self, image_rgb: np.ndarray, input_size=(640, 640)) -> list[dict]:
@@ -471,11 +476,12 @@ class SCRFDDetector:
         det_img[:new_h, :new_w, :] = resized
 
         s, b, k = self._forward(det_img, self._confidence)
-        if not s or sum(x.size for x in s) == 0:
+        s = [x for x in s if x.size]
+        if not s or not b or not k:
             return []
-        scores = np.vstack(s).ravel()
-        boxes = np.vstack(b) / det_scale
-        kpss = np.vstack(k) / det_scale
+        scores = np.hstack(s).ravel()
+        boxes = np.vstack([x for x in b if x.size]) / det_scale
+        kpss = np.vstack([x for x in k if x.size]) / det_scale
         order = scores.argsort()[::-1]
         scores, boxes, kpss = scores[order], boxes[order], kpss[order]
 
@@ -499,7 +505,7 @@ class SCRFDDetector:
             idx = idx[1:][iou <= 0.4]
         keep = np.array(keep, dtype=int)
         return [{
-            "bbox": boxes[i],
+            "bbox": [float(v) for v in boxes[i]],
             "landmarks": kpss[i],
             "confidence": float(scores[i]),
         } for i in keep]
@@ -542,12 +548,16 @@ class EdgeFaceAdapter:
 
         # ── Face detector ──
         self._confidence = confidence
-        if detector == "scrfd":
-            self._detector = SCRFDDetector(model_dir, confidence)
-            log.info(f"[face] SCRFD-500M-KPS loaded, conf={confidence}")
-        else:
+        if detector == "yunet":
             self._detector = YuNetDetector(model_dir, confidence)
             log.info(f"[face] YuNet loaded, conf={confidence}")
+        else:
+            self._detector = SCRFDDetector(
+                model_dir, confidence,
+                {"scrfd": "scrfd_500m_kps.onnx",
+                 "scrfd_2.5g": "scrfd_2.5g_bnkps_hsuyabc.onnx"}.get(detector),
+            )
+            log.info(f"[face] SCRFD ({detector}) loaded, conf={confidence}")
 
         # ── Preprocessing transform (same as training) ──
         self._transform = transforms.Compose([

@@ -920,6 +920,55 @@ a901b40: 评测诊断日志 (load_diag 库健康统计 + diag 字段)，保留�
     (cp38 jp5.11 / cp310 jp6.1 双 ABI 的最后一个版本，与 sherpa-onnx 钉版一致)，
     CPU provider 以避免 10 容器 CUDA 上下文 OOM。需重新提交评测。
 
+13) testset_large 本地大评测 (bench_all_large.py, 2026-09-07/08, Jetson):
+    数据集 (build_testset_large.py, LFW deepfunneled 全量):
+      known:   身份图片数>=5 → 423 身份, 1 张进 face_db, 其余 5562 张进 probe
+               (每身份最多取 8 张 → 2660 known probe)
+      unknown: 恰好 1 张图的 4069 身份 → probe_unknown (采样 1200)
+      共 3860 probe = 2660 known + 1200 unknown, 10054 jpg
+    指标: (已知正确命中 + 未知正确拒识) / 3860 — 平台 "Identification Accuracy
+    @ IoU>=0.5" 的代理; LFW 单脸裁剪图上 IoU>=0.5 ⇔ 存在检测框
+    组合: 4 检测器 (yunet/scrfd_500m/2.5g/10g) x 4 识别器
+          (edgeface_s/edgeface_base/w600k_mbf/sface) = 16 组合全扫
+    结果表 (阈值 0.55/0.50/0.45/0.40/0.35/0.30/0.25):
+    det          rec             @0.55   @0.50   @0.45   @0.40   @0.35   @0.30   @0.25
+    yunet        edgeface_s      0.9215  0.9487  0.9619  0.9684  0.9705  0.9715  0.9718
+    yunet        edgeface_base   0.8912  0.9303  0.9539  0.9655  0.9699  0.9718  0.9720
+    yunet        w600k_mbf       0.7085  0.8073  0.8788  0.9241  0.9484  0.9624  0.9679
+    yunet        sface           0.8510  0.9054  0.9409  0.9536  0.9617  0.9635  0.9637
+    scrfd_500m   edgeface_s      0.9313  0.9516  0.9619  0.9658  0.9666  0.9668  0.9668
+    scrfd_500m   edgeface_base   0.9047  0.9360  0.9554  0.9645  0.9676  0.9684  0.9687
+    scrfd_500m   w600k_mbf       0.7345  0.8326  0.8959  0.9324  0.9518  0.9627  0.9663
+    scrfd_500m   sface           0.8744  0.9205  0.9451  0.9596  0.9619  0.9619  0.9619
+    scrfd_2.5g   edgeface_s      0.9456  0.9624  0.9715  0.9769  0.9777  0.9780  0.9780
+    scrfd_2.5g   edgeface_base   0.9098  0.9482  0.9640  0.9746  0.9780  0.9793  0.9798
+    scrfd_2.5g   w600k_mbf       0.7339  0.8345  0.9021  0.9425  0.9627  0.9738  0.9777
+    scrfd_2.5g   sface           0.8751  0.9288  0.9541  0.9668  0.9725  0.9728  0.9728
+    scrfd_10g    edgeface_s      0.9446  0.9609  0.9723  0.9762  0.9777  0.9780  0.9780
+    scrfd_10g    edgeface_base   0.9117  0.9472  0.9640  0.9756  0.9788  0.9788  0.9795
+    scrfd_10g    w600k_mbf       0.7378  0.8409  0.9013  0.9394  0.9606  0.9731  0.9767
+    scrfd_10g    sface           0.8788  0.9277  0.9575  0.9684  0.9718  0.9725  0.9728
+    检测延迟 (Orin CPU, 1280 上限): yunet p50 4.1ms (fps 235) / 500m 43.9ms (22.4) /
+      2.5g 89.7ms (11.1) / 10g 287.7ms (3.5)
+    嵌入延迟 p50: edgeface_s ~947ms / base ~1270ms / w600k_mbf ~50ms / sface ~35ms
+    结论:
+      - scrfd_2.5g 是唯一明显超过 yunet 的检测器: edgeface_s 组合 @0.4
+        0.9769 vs 0.9684 (+0.85pt); 10g 与 2.5g 接近但检测慢 3.2 倍
+      - edgeface_s @0.4 仍是参数量/延迟/精度最均衡点; w600k_mbf 阈值敏感
+      - scrfd_500m 本地也平庸 (0.9658 @0.4, 四检测器最差) — 与平台 -7pt
+        回归方向一致
+      - 风险: LFW→平台外推不可靠 (500m 本地 -0.4pt 但平台 -7pt), 2.5g 优势
+        需平台实测验证 — 新平台日志 metrics: accuracy (IoU 匹配且识别正确) /
+        iou_accuracy (IoU 匹配准确率) / face_accuracy (人脸识别准确率)
+        可分离检测 vs 识别贡献
+    过程事故: 首轮 acc 恒为 0.3109 — probe 相对路径漏了 "probe/" 前缀导致
+      2660 known probe 全部读不到图; 修正后清缓存重跑
+    落地 (本次提交): face.py 合入 scrfd_2.5g (枚举/权重表/SCRFDDetector 文件名参数/
+      2.5G 输出 reshape + scores[:,0] 修复/bbox 转 float 保证 JSON 序列化);
+      权重 scrfd_2.5g_bnkps_hsuyabc.onnx (3.3MB) 已传 juicefs face/ 并验证 200;
+      config 切 detector: scrfd_2.5g + edgeface_s_gamma_05 + threshold 0.4
+      (~1.04s/帧, ~1fps, 低于 3fps 上限)
+
 perception/Dockerfile.jetson             修改 — 添加 face 依赖 (timm 等) + COPY edgeface_src;
                                         5ec227f 补装 onnxruntime==1.18.1 (SCRFD 检测器运行时依赖)
 perception/main.py                       修改 — 加载 FaceRecognitionPlugin + 环境变量端口
