@@ -733,7 +733,7 @@ curl -s http://localhost:15720 -X POST \
 
 env:
   - name: PHANTHYMOTUS_COMMIT_ID
-    value: "<本次提交 full SHA — commit 后填入>"
+    value: "957fe6a8598c3017d546497b30664cc189d67367"
   - name: PHANTHYMOTUS_REPO
     value: "https://github.com/gaogaoonholiday/phanthymotus.git"
   - name: JP_VERSION
