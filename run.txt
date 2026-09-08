@@ -725,11 +725,11 @@ curl -s http://localhost:15720 -X POST \
 10. 榜单提交
 ================================================================================
 
-代码已推送，仓库已设为 public，提交信息如下:
+代码已推送，仓库已设为 public，提交信息如下 (f16dec6: scrfd_2.5g + edgeface_s 组合):
 
 env:
   - name: PHANTHYMOTUS_COMMIT_ID
-    value: "5ec227f"
+    value: "f16dec6e1d9688f2d92ae3ec4898d64ecfd6e07d"
   - name: PHANTHYMOTUS_REPO
     value: "https://github.com/gaogaoonholiday/phanthymotus.git"
   - name: JP_VERSION
