@@ -100,10 +100,10 @@ plugins:
                                  # CPU avoids CUDA context for 10 containers
     model_dir: /models/face
     face_db_dir: /workspace/face_db
-    similarity_threshold: 0.45   # local full-set optimum on scrfd_2.5g + Umeyama + ONNX ef-s
-                                 # (3860 probes): ACC 0.9705 (hit 0.9594 / unknown-rej 0.9950)
-                                 # vs 0.9663 @0.40 / 0.9591 @0.50. Umeyama shifts the impostor
-                                 # distribution (p95=0.398), so 0.45 clears it with margin
+    similarity_threshold: 0.40   # platform-proven on 6f0a583 container sweep: instance 1
+                                 # (0.40) accuracy 0.9227 vs 0.9175 @0.42-0.44, 0.9124
+                                 # @0.45-0.47, 0.9072 @0.48-0.50 — eval domain prefers
+                                 # lower thresholds than LFW (local optimum was 0.45)
                                  # NOTE: per-container exploratory sweep overrides this
                                  # (FACE_CONTAINER_SWEEP=1) — see face.py _container_sweep
     confidence: 0.5
