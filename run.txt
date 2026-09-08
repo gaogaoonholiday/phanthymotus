@@ -733,7 +733,7 @@ edgeface_s + Umeyama 对齐 + 阈值 0.45 + 容器扫描探索):
 
 env:
   - name: PHANTHYMOTUS_COMMIT_ID
-    value: "<本次提交 full SHA — commit 后填入>"
+    value: "6f0a583448fc86f404782272a720c3a57ee22e84"
   - name: PHANTHYMOTUS_REPO
     value: "https://github.com/gaogaoonholiday/phanthymotus.git"
   - name: JP_VERSION
