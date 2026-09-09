@@ -444,15 +444,15 @@ class YuNetDetector:
         )
         self._confidence = confidence
 
-    def detect(self, image_rgb: np.ndarray) -> list[dict]:
+    def _detect_at(self, image_rgb, scale) -> list[dict]:
         import cv2
         H, W = image_rgb.shape[:2]
         if W > _DETECT_TARGET_W:
-            scale = _DETECT_TARGET_W / W
-            new_w, new_h = _DETECT_TARGET_W, int(H * scale)
+            s = _DETECT_TARGET_W / W
+            new_w, new_h = _DETECT_TARGET_W, int(H * s)
             img = cv2.resize(image_rgb, (new_w, new_h))
         else:
-            scale = 1.0
+            s = 1.0
             new_w, new_h = W, H
             img = image_rgb
 
@@ -471,11 +471,36 @@ class YuNetDetector:
                 [f[10], f[11]], [f[12], f[13]],
             ], dtype=np.float32)
             out.append({
-                "bbox": [x / scale, y / scale, (x + w) / scale, (y + h) / scale],
-                "landmarks": landmarks / scale,
+                "bbox": [x / s / scale, y / s / scale,
+                         (x + w) / s / scale, (y + h) / s / scale],
+                "landmarks": landmarks / s / scale,
                 "confidence": float(f[14]),
             })
         return out
+
+    def detect(self, image_rgb: np.ndarray) -> list[dict]:
+        dets = self._detect_at(image_rgb, 1.0)
+        if dets:
+            return dets
+        # Fallback for face-free frames: platform eval showed payload={} on
+        # frames where the face is detectable only at a lower score threshold
+        # (local: 12/14 no-det images have a det at conf 0.32-0.49). Retry with
+        # threshold 0.3 on a 2x-upscaled image; only affects frames that would
+        # otherwise publish an empty payload.
+        import cv2
+        try:
+            self._det.set("scoreThreshold", 0.3)
+        except cv2.error:
+            pass
+        try:
+            up = cv2.resize(image_rgb, None, fx=2.0, fy=2.0,
+                            interpolation=cv2.INTER_CUBIC)
+            return self._detect_at(up, 2.0)
+        finally:
+            try:
+                self._det.set("scoreThreshold", self._confidence)
+            except cv2.error:
+                pass
 
 
 class SCRFDDetector:
@@ -495,8 +520,10 @@ class SCRFDDetector:
         self._confidence = confidence
         self._cache = {}
 
-    def _forward(self, det_img, thresh):
+    def _forward(self, det_img, thresh=None):
         import cv2
+        if thresh is None:
+            thresh = self._confidence
         H, W = det_img.shape[:2]
         blob = cv2.dnn.blobFromImage(
             det_img, 1.0 / 128.0, (W, H), (127.5, 127.5, 127.5), swapRB=True
@@ -526,7 +553,15 @@ class SCRFDDetector:
             s_list.append(scores[pos, 0])
         return s_list, b_list, k_list
 
-    def detect(self, image_rgb: np.ndarray, input_size=(640, 640)) -> list[dict]:
+    def _detect_at(self, image_rgb, input_size=(640, 640), thresh=None,
+                   scale: float = 1.0) -> list[dict]:
+        """Detect on image_rgb, return coords in the ORIGINAL image frame.
+
+        `scale` is the factor image_rgb was pre-upscaled by relative to the
+        original (detect() passes 2.0 for its fallback retry); boxes/kpss come
+        out in upscaled coords and are divided back down, mirroring YuNet's
+        `bbox / s / scale`.
+        """
         import cv2
         bgr = image_rgb[:, :, ::-1]
         im_ratio = bgr.shape[0] / bgr.shape[1]
@@ -542,13 +577,13 @@ class SCRFDDetector:
         det_img = np.zeros((input_size[1], input_size[0], 3), dtype=np.uint8)
         det_img[:new_h, :new_w, :] = resized
 
-        s, b, k = self._forward(det_img, self._confidence)
+        s, b, k = self._forward(det_img, thresh)
         s = [x for x in s if x.size]
         if not s or not b or not k:
             return []
         scores = np.hstack(s).ravel()
-        boxes = np.vstack([x for x in b if x.size]) / det_scale
-        kpss = np.vstack([x for x in k if x.size]) / det_scale
+        boxes = np.vstack([x for x in b if x.size]) / (det_scale * scale)
+        kpss = np.vstack([x for x in k if x.size]) / (det_scale * scale)
         order = scores.argsort()[::-1]
         scores, boxes, kpss = scores[order], boxes[order], kpss[order]
 
@@ -576,6 +611,20 @@ class SCRFDDetector:
             "landmarks": kpss[i],
             "confidence": float(scores[i]),
         } for i in keep]
+
+    def detect(self, image_rgb: np.ndarray) -> list[dict]:
+        dets = self._detect_at(image_rgb)
+        if dets:
+            return dets
+        # Fallback for face-free frames: platform eval showed payload={} on
+        # frames where the face is detectable only at a lower score threshold
+        # (local: 12/14 no-det images have a det at conf 0.32-0.49). Retry with
+        # threshold 0.3 on a 2x-upscaled image; only affects frames that would
+        # otherwise publish an empty payload.
+        import cv2
+        up = cv2.resize(image_rgb, None, fx=2.0, fy=2.0,
+                        interpolation=cv2.INTER_CUBIC)
+        return self._detect_at(up, thresh=0.3, scale=2.0)
 
 
 class EdgeFaceAdapter:

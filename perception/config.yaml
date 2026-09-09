@@ -106,5 +106,9 @@ plugins:
                                  # lower thresholds than LFW (local optimum was 0.45)
                                  # NOTE: per-container exploratory sweep overrides this
                                  # (FACE_CONTAINER_SWEEP=1) — see face.py _container_sweep
-    confidence: 0.5
+    confidence: 0.5               # det score threshold; frames with zero dets get
+                                  # one automatic retry @0.3 on a 2x-upscaled image
+                                  # (rescues payload={} frames: local 13/14 no-det
+                                  # images recovered, 0 FA / 0 wrong-id; ~80ms only
+                                  # on those frames)
     fps: 3

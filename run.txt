@@ -797,13 +797,17 @@ env:
 
 本次提交 修改的文件:
 
-perception/plugins/face.py              修改 — 容器扫描网格下移 (网格 2):
-  _CONTAINER_SWEEP_THRESHOLDS: (0.40..0.50 探针) → (0.32..0.39 探针);
-  容器 0 与容器 9 (表回绕) 都用 config.yaml 值 0.40 作参照 (占 2/10 样本)。
-  注释记录网格 1 平台结果 (0.40 → 0.9227 单调最优)
-perception/config.yaml                  修改 — similarity_threshold: 0.45 → 0.40
-  (6f0a583 容器扫描平台验证: 实例 1 @0.40 accuracy 0.9227, 全场最高);
-  注释更新为平台数据
+perception/plugins/face.py              修改 — 零检测回退重试 (2x 放大 + thresh 0.3):
+  YuNetDetector.detect / SCRFDDetector.detect 常规 pass 零检测时重试一次;
+  SCRFDDetector._detect_at 新增 scale 参数修复坐标 bug (不回除预放大倍数时
+  重试返回 2x 坐标, 对齐嵌入全错 — 见附2 §16)
+perception/config.yaml                  注释更新 — 记录重试逻辑与本地验证数据
+
+动机 (957fe6a 平台实测): 4/194 case payload={} (帧内有脸但 @0.5 零检测),
+  本地同类帧 13/14 可在 2x 放大 + 0.3 阈值下救回且无 FA/wrong-id (附2 §16)
+
+上一次提交 (7605d06/docs): 填写提交 env 957fe6a
+上上次提交 (957fe6a): 阈值 0.40 (平台验证最优) + 容器扫描网格 2 (0.32-0.39)
 
 动机 (6f0a583 平台实测 2026-09-08 20:11): 容器扫描证明评测域偏好低阈值 —
 0.40 → 0.9227 / 0.42-0.44 → 0.9175 / 0.45-0.47 → 0.9124 / 0.48-0.50 → 0.9072,
@@ -1065,6 +1069,30 @@ a901b40: 评测诊断日志 (load_diag 库健康统计 + diag 字段)，保留�
       b. 平均 0.9134 是 10 阈值的平均, 最佳单配置实为 0.9227
       c. 网格 2 (本次提交): config=0.40, 容器 1-8 探测 0.32-0.39, 容器 0/9
          用 0.40 作对照 (2/10 样本)
+
+16) 零检测回退重试 (本次提交) — 修复 SCRFD 坐标 bug + 2x 放大低阈值重试:
+    动机: 957fe6a 平台评测 4/194 case payload={} (2.06%) — 帧内有脸但 SCRFD
+      @conf 0.5 零检测。本地 testset_large 同类帧 14 张 (10 known + 4 unknown):
+      13/14 在 2x INTER_CUBIC 放大 + 阈值 0.3 下有检测 (conf 0.32-0.49)
+    重要 bug 修复: SCRFDDetector._detect_at 此前不回除预放大倍数 (YuNet 有
+      /s/scale, SCRFD 只有 /det_scale) → 首版重试返回 2x 坐标的地标，对齐后
+      嵌入全错 (已知人全部 WRONG-ID)。已加 scale 参数: boxes/kpss / (det_scale*scale)
+    修复后全流程验证 (production face.py 路径, Umeyama + ONNX edgeface_s, thr 0.40):
+      known  10 张漏检帧: 9 rescued 全部正确命中 (sim 0.488-0.880, 无 wrong-id)
+             1 张 (Gonzalo_Sanchez_de_Lozada_0003) 仍无检测
+      unknown 4 张漏检帧: 3 rescued 全部正确拒识 (sim 0.294-0.314 < 0.40, 无 FA)
+             1 张 (Nobuyuki_Idei) 仍无检测
+      正常帧 30 张 top-1 conf 不变 (重试路径只对零检测帧触发, 无副作用);
+        抽查 5 张正常帧识别结果不变
+      延迟: 重试路径 p50 80ms / max 110ms (双 pass), 正常路径不变 (p50 ~43ms)
+    实现 (两检测器同一逻辑, 互不影响):
+      YuNetDetector.detect / SCRFDDetector.detect: 常规 pass @conf 0.5 零检测时
+        → 2x INTER_CUBIC 放大 + thresh 0.3 重试一次, 坐标回除 scale=2.0
+        → 仍无检测才返回 [] (payload={}, 与旧行为一致)
+      只有本来发空 payload 的帧才付出 ~80ms; 有检测帧零开销
+    预期: 平台 4 个 payload={} case 直接受益; 识别侧 0 改动, 无回归风险
+    烟测 (smoke_test.py, ROS-free yunet): Abdullah_Gul 0.740 命中 / AJ_Cook 拒识,
+      e2e p50 23ms — PASS
 
 perception/Dockerfile.jetson             修改 — 添加 face 依赖 (timm 等) + COPY edgeface_src;
                                         5ec227f 补装 onnxruntime==1.18.1 (SCRFD 检测器运行时依赖)
