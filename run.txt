@@ -728,12 +728,13 @@ curl -s http://localhost:15720 -X POST \
 10. 榜单提交
 ================================================================================
 
-代码已推送，仓库已设为 public，提交信息如下 (最新: 新版榜单 F1 接口适配
-register_by_corpus + 身份管理 API，前置提交: 零检测回退重试 + SCRFD 坐标修复):
+代码已推送，仓库已设为 public，提交信息如下 (最新: 补齐新版榜单流式接口
+register_by_stream/recognize_by_stream/list_visits (darvin.txt F1 规范)，
+前置提交: register_by_corpus + 身份管理 API):
 
 env:
   - name: PHANTHYMOTUS_COMMIT_ID
-    value: "dfacd04c35d79fbd7a50be9c38ed03d70573dbec"
+    value: "31852ea"
   - name: PHANTHYMOTUS_REPO
     value: "https://github.com/gaogaoonholiday/phanthymotus.git"
   - name: JP_VERSION
@@ -833,6 +834,8 @@ env:
   perception/tests/test_face_registration.py — 7 项: 端到端注册→匹配→CRUD→
                                              forget, ZIP 分发, 并发注册
 
+上次提交 (dfacd04) 修改的文件 (perception/plugins/face_corpus.py 等) 见 §10.2。
+
 验证边界 (重要):
   - 18 项测试全部通过 (模拟 embedding, 无需 ROS/模型)
   - 本地无 ROS2 环境, 未跑真实 onnxruntime 注册链路
@@ -840,10 +843,65 @@ env:
     调用未实现的 register_by_stream/list_visits, 待本次平台运行确认
 
 ================================================================================
+10.3 流式接口实现 (31852ea, 2026-09-17, darvin.txt F1 规范)
+================================================================================
+
+上次平台运行 (§17) 中 register_by_corpus 成功 (30/30, p-1..p-30) 后, 评测器
+随即调用 register_by_stream → 3 实例全部报
+  "Tool face_recognition does not handle action 'register_by_stream'"
+本次提交 (31852ea) 按 darvin.txt 流式契约补齐, 保持模型/阈值不变:
+
+新增 MCP actions:
+  register_by_stream  — 从 ROS 视频流窗口注册身份。取窗口内最新
+                        enroll_max_analyzed(8) 帧, 逐帧检测嵌入; 以第一帧为锚,
+                        与锚 cosine ≥ similarity_threshold 的帧为"一致帧";
+                        一致帧数*2 < 分析帧数 → ambiguous_subject (窗口内主体
+                        不一致, 拒绝注册)。一致帧全部写入 FaceDatabase, 返回
+                        person_id/frames_used/frames_examined/window_s
+  recognize_by_stream — 只读识别: 窗口(默认 1s)内逐帧识别, 同一 person_id 取
+                        最高分脸; 若窗口内有脸但全部未登记, 上报置信度最高的
+                        未识别脸 (known=false), 不自动登记
+  list_visits         — 到访记录: 每次推理对识别出的人 record_sighting,
+                        VISIT_GAP_S(600s) 无再现视为离开 (visit 关闭)。支持
+                        person_id/since/until (epoch 秒或 ISO8601)/limit/offset
+                        过滤; [since,until] 与 [first_seen,last_seen] 重叠即命中;
+                        打开中的 visit 带 open:true; name 在读取时解析 (先注册
+                        后到访也能显示名字)
+
+关键设计:
+  a. _image_cb 在 fps 限流判断之前就把 (jpeg bytes, ts) 记入滚动窗口
+     (deque maxlen=60, 锁保护, 3.0s 淘汰) — 评测器只发布 1 帧就调
+     register_by_stream, 若记录放在限流之后会整窗为空
+  b. 实例路由 _pick_instance: 带 instance_id → 指定节点; 恰好一个节点 → 它;
+     多节点未带 id → bad_input (列出可用实例); 无帧 → no_frames
+  c. 失败语义分层: bad_input(帧不可解码) / no_face(有帧无人脸) / no_frames
+     (窗口空) / ambiguous_subject(锚一致性不足), 多帧失败取最具体原因
+  d. register 复用共享 FaceDatabase.enroll (与 register_by_corpus/ROS 推理
+     同一对象), 额外样本以显式 person_id 逐帧并入
+  e. inputSchema action enum 扩展至 16 个 action, 新增 window_s/instance_id/
+     since/until 参数
+
+测试:
+  perception/tests/test_face_stream.py — 5 项 (ROS-free): 窗口逐帧记录且
+  最旧在前 / 注册+识别+全部失败门 / 多帧注册与显式 person_id 追加
+  (3 帧 → samples 3, 追加 → 6) / 未识别脸上报 known=false / list_visits
+  重叠过滤与名字延迟解析。全套 12 项通过 (test_face_registration +
+  test_face_candidates + test_face_stream)
+
+================================================================================
 附: 文件清单
 ================================================================================
 
-本次提交 修改的文件:
+本次提交 (31852ea) 修改的文件:
+
+perception/plugins/face.py              修改 — 流式接口 (§10.3): 滚动窗口
+  (_image_cb 限流前记录), register_by_stream/recognize_by_stream/list_visits,
+  _pick_instance/_stream_action, FaceDatabase record_sighting/
+  close_stale_visits/list_visits/_parse_time
+perception/tests/test_face_stream.py    新增 — 5 项 (ROS-free, AST 提取
+  _FaceNode 方法)
+
+上次提交 (dfacd04) 修改的文件:
 
 perception/plugins/face.py              修改 — 新版榜单接口适配 (§10.2):
   register_by_corpus/photo/url, recognize_by_photo/url, list_persons,
@@ -1167,6 +1225,10 @@ a901b40: 评测诊断日志 (load_diag 库健康统计 + diag 字段)，保留�
     修复: dfacd04 (§10.2)。评测在识别阶段之前失败 → 新版输出契约
       (faces[]/identity.status) 与后续动作 (register_by_stream/list_visits
       等) 是否被调用仍待下次平台运行验证
+    2026-09-17 复跑 (同日): register_by_corpus 已通过 (30/30, p-1..p-30),
+      评测推进到下一阶段 → register_by_stream 缺失, 3 实例同样报
+      "does not handle action 'register_by_stream'" (-32603), exit 1
+    修复: 31852ea (§10.3) — darvin.txt 流式契约 + list_visits 到访日志
 
 perception/Dockerfile.jetson             修改 — 添加 face 依赖 (timm 等) + COPY edgeface_src;
                                         5ec227f 补装 onnxruntime==1.18.1 (SCRFD 检测器运行时依赖)
