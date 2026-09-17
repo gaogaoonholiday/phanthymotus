@@ -28,6 +28,7 @@ import queue
 import threading
 import time
 import urllib.request
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -51,6 +52,14 @@ _MODEL_BASE_URL = os.environ.get(
 # ── Constants ────────────────────────────────────────────────────────────────
 DEFAULT_SIMILARITY_THRESHOLD = 0.5  # cosine similarity above this = same person
 DEFAULT_MODEL_NAME = "edgeface_s_gamma_05"  # 3.65M params, ~14MB checkpoint (eval-proven: 0.9165)
+
+# Stream enrolment window (register_by_stream / recognize_by_stream): each node
+# keeps the last few seconds of frames, bounded by age and count, so a stream
+# action can answer "who is in front of me" over several frames instead of one.
+ENROLL_WINDOW_S = 3.0
+ENROLL_WINDOW_MAX_FRAMES = 60
+ENROLL_MAX_ANALYZED = 8
+VISIT_GAP_S = 600.0  # absent this long → visit closed
 
 # ── Per-container exploratory sweep ─────────────────────────────────────────
 # The platform runs 10 identical containers of the same commit, each with a
@@ -130,8 +139,10 @@ TOOLS = [
                     "type": "string",
                     "enum": ["start", "stop", "info", "config",
                              "register_by_corpus", "register_by_photo", "register_by_url",
-                             "recognize_by_photo", "recognize_by_url",
-                             "list_persons", "get_person", "update_person", "forget"],
+                             "register_by_stream",
+                             "recognize_by_photo", "recognize_by_url", "recognize_by_stream",
+                             "list_persons", "get_person", "update_person", "forget",
+                             "list_visits"],
                     "description": "Action to perform"
                 },
                 "package": {"type": "string", "description": "Directory, ZIP or tar.gz path/URL"},
@@ -145,6 +156,12 @@ TOOLS = [
                 "merge": {"type": "boolean", "default": True},
                 "named": {"type": "string", "enum": ["all", "named", "unknown"]},
                 "query": {"type": "string"},
+                "window_s": {"type": "number", "minimum": 0.1,
+                             "description": "How many seconds of recent stream to look back. register_by_stream default 3.0, recognize_by_stream default 1.0; capped by the plugin enrolment window"},
+                "instance_id": {"type": "string",
+                                "description": "Which running instance to read frames from; optional when exactly one is running"},
+                "since": {"type": "string", "description": "list_visits start time, epoch seconds or ISO-8601"},
+                "until": {"type": "string", "description": "list_visits end time, same format as since; empty = now"},
                 "limit": {"type": "integer", "minimum": 1, "default": 100},
                 "offset": {"type": "integer", "minimum": 0},
                 "input_topic": {
@@ -266,6 +283,8 @@ class FaceDatabase:
         self.load_diag: Optional[str] = None
         self._persons: dict[str, dict] = {}
         self._next_person_id = 1
+        self._open_visits: dict[str, dict] = {}
+        self._closed_visits: list[dict] = []
 
     @staticmethod
     def _clean_profile(profile):
@@ -551,6 +570,95 @@ class FaceDatabase:
     def count(self) -> int:
         with self._lock:
             return sum(len(v) for v in self._embeddings.values())
+
+    # ── visit log (in-memory) ─────────────────────────────────────────────
+    # The platform evaluation runs are short and read via list_visits, so
+    # visits are kept in memory: record_sighting opens/extends a visit per
+    # person, close_stale_visits moves stale ones to the closed list.
+
+    def record_sighting(self, person_id: str, when: float, topic: str = ""):
+        """Note that person_id was seen at `when`; open or extend its visit."""
+        with self._lock:
+            person = self._persons.get(person_id)
+            visit = self._open_visits.get(person_id)
+            if visit is None:
+                self._open_visits[person_id] = {
+                    "person_id": person_id,
+                    "name": person["name"] if person else "",
+                    "first_seen": float(when),
+                    "last_seen": float(when),
+                    "sightings": 1,
+                    "topic": topic,
+                }
+            else:
+                visit["last_seen"] = max(visit["last_seen"], float(when))
+                visit["sightings"] += 1
+                if person is not None and person["name"]:
+                    visit["name"] = person["name"]
+
+    def close_stale_visits(self, now: Optional[float] = None, force: bool = False) -> int:
+        """Move visits whose subject has been absent for VISIT_GAP_S to the
+        closed list. force=True closes all (used when an instance stops)."""
+        moment = time.time() if now is None else float(now)
+        with self._lock:
+            due = [pid for pid, visit in self._open_visits.items()
+                   if force or moment - visit["last_seen"] >= VISIT_GAP_S]
+            for pid in due:
+                self._closed_visits.append(self._open_visits.pop(pid))
+            return len(due)
+
+    def _parse_time(self, value):
+        """Epoch seconds or ISO-8601; None passes through. Raises ValueError."""
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            pass
+        from datetime import datetime
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        except ValueError as error:
+            raise ValueError(f"unparseable time: {value!r}") from error
+
+    def list_visits(self, person_id: str = "", since=None, until=None,
+                    limit: int = 100, offset: int = 0) -> dict:
+        """Visits overlapping [since, until], newest first.
+
+        Overlap rather than containment: someone who arrived at 14:50 and left
+        at 15:10 *was* there at 15:00.
+        """
+        start = self._parse_time(since)
+        end = self._parse_time(until)
+        with self._lock:
+            records = [{**visit, "open": True} for visit in self._open_visits.values()]
+            records.extend(dict(visit) for visit in self._closed_visits)
+
+            def overlaps(visit):
+                first = float(visit.get("first_seen") or 0.0)
+                last = float(visit.get("last_seen") or first)
+                if start is not None and last < start:
+                    return False
+                if end is not None and first > end:
+                    return False
+                return True
+
+            if person_id:
+                records = [r for r in records if r.get("person_id") == person_id]
+            records = [r for r in records if overlaps(r)]
+            records.sort(key=lambda r: float(r.get("last_seen") or 0.0), reverse=True)
+
+            total = len(records)
+            begin = max(0, int(offset))
+            stop = begin + max(0, int(limit)) if limit else total
+            page = records[begin:stop]
+            # Names change; resolve them at read time so old records stay fresh.
+            for visit in page:
+                person = self._persons.get(visit.get("person_id", ""))
+                if person is not None:
+                    visit["name"] = person["name"]
+            return {"total": total, "offset": begin, "limit": int(limit),
+                    "since": start, "until": end, "visits": page}
 
 
 # ── EdgeFace + Detector Adapter ──────────────────────────────────────────────
@@ -929,6 +1037,24 @@ class _FaceNode(Node):
         self._detect_count = 0
         self._diag_db_sent = False
 
+        # Rolling stream window, kept beside the inference queue rather than in
+        # place of it: the worker still wants "newest frame, drop the rest",
+        # while register_by_stream/recognize_by_stream want the last few
+        # seconds. Bounded by age and count, so a fast camera cannot grow it
+        # without limit.
+        self._window: deque = deque(maxlen=ENROLL_WINDOW_MAX_FRAMES)
+        self._window_lock = threading.Lock()
+        self._window_seconds = ENROLL_WINDOW_S
+
+    def recent_frames(self, window_s: Optional[float] = None) -> list:
+        """Frames captured within the last `window_s` seconds, oldest first."""
+        limit = self._window_seconds if window_s is None else min(
+            float(window_s), self._window_seconds
+        )
+        cutoff = time.time() - max(0.0, limit)
+        with self._window_lock:
+            return [item for item in self._window if item[1] >= cutoff]
+
     def start(self) -> dict:
         if self._sub is not None:
             return {"state": "running", "input": self._input_topic, "output": self._output_topic}
@@ -954,7 +1080,16 @@ class _FaceNode(Node):
         return {"state": "idle", "input": self._input_topic}
 
     def _image_cb(self, msg: CompressedImage):
+        now_wall = time.time()
         now = time.monotonic()
+        # Record every frame into the stream window before any rate limiting —
+        # the stream actions read history, so they must see what the camera
+        # sent even between inference ticks.
+        with self._window_lock:
+            self._window.append((bytes(msg.data), now_wall))
+            cutoff = now_wall - self._window_seconds
+            while self._window and self._window[0][1] < cutoff:
+                self._window.popleft()
         if now - self._last_inference_time < self._frame_interval:
             return
         self._last_inference_time = now
@@ -1036,6 +1171,12 @@ class _FaceNode(Node):
                     best = max(faces, key=lambda face: face["detect_confidence"])
                     result.update({key: best[key] for key in
                                    ("detect_confidence", "bbox_relative", "identity")})
+                    # Visit bookkeeping: one sighting per recognised person.
+                    for face in faces:
+                        if face["person_id"]:
+                            self._face_db.record_sighting(
+                                face["person_id"], result["ts"], self._input_topic)
+                    self._face_db.close_stale_visits()
                 msg = String()
                 msg.data = json.dumps(result, ensure_ascii=False)
                 self._pub.publish(msg)
@@ -1208,6 +1349,175 @@ class FaceRecognitionPlugin:
         return {"ok": True, "source": package, "total": len(results),
                 "registered": registered, "failed": len(results) - registered, "results": results}
 
+    # ── stream actions ─────────────────────────────────────────────────────
+
+    def _pick_instance(self, instance_id: str):
+        """Resolve which running instance a stream action reads from.
+
+        Returns (node, None) or (None, failure). With exactly one instance the
+        id is optional; with several it is required rather than guessed.
+        """
+        if instance_id:
+            node = self._nodes.get(instance_id)
+        elif len(self._nodes) == 1:
+            node = next(iter(self._nodes.values()))
+        else:
+            node = None
+            if len(self._nodes) > 1:
+                return None, {
+                    "ok": False, "reason": "bad_input",
+                    "detail": (f"{len(self._nodes)} instances are running; pass "
+                               "instance_id to say which camera to use"),
+                    "instances": sorted(self._nodes),
+                }
+        if node is None:
+            return None, {
+                "ok": False, "reason": "no_frames",
+                "detail": ("no running instance to read from — start the card "
+                           "on a camera topic first"),
+            }
+        return node, None
+
+    def _analyze_stream_frame(self, jpeg_bytes: bytes):
+        """Decode one stream frame and embed its faces.
+
+        Returns (shape, detections), or None if the frame is undecodable.
+        """
+        import cv2
+
+        frame = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            return None
+        rgb = frame[:, :, ::-1]
+        with self._model_lock:
+            return frame.shape, self._model.detect_and_embed(rgb)
+
+    def _register_stream(self, args):
+        self._ensure_model()
+        node, failure = self._pick_instance(str(args.get("instance_id") or ""))
+        if node is None:
+            return failure
+
+        window = min(float(args.get("window_s") or ENROLL_WINDOW_S), ENROLL_WINDOW_S)
+        frames = node.recent_frames(window)
+        if not frames:
+            return {"ok": False, "reason": "no_frames",
+                    "detail": f"no frames received in the last {window:.1f}s",
+                    "instance_id": node._input_topic}
+
+        # Analyse newest-first and cap the count: the window can hold 60
+        # frames and running detection over all of them costs seconds for no
+        # extra accuracy.
+        selected = list(reversed(frames))[:ENROLL_MAX_ANALYZED]
+        embeddings, failures = [], []
+        for jpeg_bytes, _ts in selected:
+            outcome = self._analyze_stream_frame(jpeg_bytes)
+            if outcome is None:
+                failures.append({"ok": False, "reason": "bad_input",
+                                 "detail": "frame could not be decoded"})
+            elif not outcome[1]:
+                failures.append({"ok": False, "reason": "no_face",
+                                 "detail": "no face detected in frame"})
+            else:
+                best = max(outcome[1], key=lambda item: item["confidence"])
+                embeddings.append(np.asarray(best["embedding"], dtype=np.float32))
+
+        if not embeddings:
+            worst = min(failures, key=lambda f: f.get("reason", ""))
+            return {**worst, "instance_id": node._input_topic,
+                    "window_s": round(window, 2)}
+
+        # Every accepted frame must show the *same* person: two people taking
+        # turns in front of the camera would otherwise become one identity
+        # that matches neither of them well.
+        anchor = embeddings[0]
+        anchor_norm = anchor / (np.linalg.norm(anchor) + 1e-8)
+        agreeing = [e for e in embeddings
+                    if float(anchor_norm @ e / (np.linalg.norm(e) + 1e-8))
+                    >= self._similarity_threshold]
+        if len(agreeing) * 2 < len(embeddings):
+            return {"ok": False, "reason": "ambiguous_subject",
+                    "detail": (f"the last {window:.1f}s did not show one stable "
+                               f"subject ({len(agreeing)} of {len(embeddings)} "
+                               "usable frames agree). Have a single person hold "
+                               "still in front of the camera."),
+                    "frames_examined": len(selected),
+                    "instance_id": node._input_topic}
+
+        with self._model_lock:
+            result = self._face_db.enroll(
+                agreeing[0], name=str(args.get("name") or ""),
+                profile=args.get("profile"),
+                person_id=args.get("person_id") or None,
+                threshold=self._similarity_threshold)
+        for extra in agreeing[1:]:
+            if not result.get("ok"):
+                break
+            extra_result = self._face_db.enroll(
+                extra, person_id=result["person_id"],
+                threshold=self._similarity_threshold)
+            if extra_result.get("ok"):
+                result["samples"] = extra_result["samples"]
+        if result.get("ok"):
+            log.info("[face] registered %s from the live stream (%d/%d frames): %s",
+                     result["person_id"], len(agreeing), len(selected),
+                     result["name"])
+        return {**result, "instance_id": node._input_topic,
+                "frames_used": len(agreeing), "frames_examined": len(selected),
+                "window_s": round(window, 2)}
+
+    def _recognize_stream(self, args):
+        self._ensure_model()
+        node, failure = self._pick_instance(str(args.get("instance_id") or ""))
+        if node is None:
+            return failure
+
+        window = min(float(args.get("window_s") or 1.0), ENROLL_WINDOW_S)
+        frames = node.recent_frames(window)
+        if not frames:
+            return {"ok": False, "reason": "no_frames",
+                    "detail": f"no frames received in the last {window:.1f}s",
+                    "instance_id": node._input_topic}
+        selected = list(reversed(frames))[:ENROLL_MAX_ANALYZED]
+
+        best: dict[str, dict] = {}
+        unidentified: list[dict] = []
+        for jpeg_bytes, _ts in selected:
+            outcome = self._analyze_stream_frame(jpeg_bytes)
+            if outcome is None:
+                continue                     # undecodable frame; try the next
+            shape, detections = outcome
+            for det in detections:
+                face = _face_result(self._face_db, det, shape, self._similarity_threshold)
+                if face["person_id"]:
+                    previous = best.get(face["person_id"])
+                    if previous is None or face["score"] > previous["score"]:
+                        best[face["person_id"]] = face
+                else:
+                    unidentified.append(face)
+
+        faces = sorted(best.values(), key=lambda f: f["score"], reverse=True)
+        if not faces and unidentified:
+            # Nobody recognised, but there were faces — report the best-looking
+            # one so the answer is "someone I do not know" not "nobody".
+            faces = [max(unidentified, key=lambda f: f["score"])]
+        return {"ok": True, "instance_id": node._input_topic,
+                "count": len(faces), "faces": faces,
+                "frames_examined": len(selected), "window_s": round(window, 2)}
+
+    def _stream_action(self, action, args):
+        try:
+            if action == "register_by_stream":
+                return self._register_stream(args)
+            if action == "recognize_by_stream":
+                return self._recognize_stream(args)
+            return {"ok": True, **self._face_db.list_visits(
+                person_id=str(args.get("person_id") or ""),
+                since=args.get("since"), until=args.get("until"),
+                limit=int(args.get("limit", 100)), offset=int(args.get("offset", 0)))}
+        except (ValueError, TypeError, KeyError) as error:
+            return {"ok": False, "reason": "bad_input", "detail": str(error)}
+
     def _identity_action(self, action, args):
         self._ensure_model()
         try:
@@ -1319,6 +1629,9 @@ class FaceRecognitionPlugin:
                             "message": "Model loading in background, will start automatically"}
                 self._start_node(node_key, input_topic)
             return self._nodes[node_key].start()
+
+        elif action in ("register_by_stream", "recognize_by_stream", "list_visits"):
+            return self._stream_action(action, args)
 
         elif action == "stop":
             if instance_id and instance_id in self._nodes:
