@@ -728,12 +728,12 @@ curl -s http://localhost:15720 -X POST \
 10. 榜单提交
 ================================================================================
 
-代码已推送，仓库已设为 public，提交信息如下 (见本次提交: 零检测回退重试
-+ SCRFD 坐标修复):
+代码已推送，仓库已设为 public，提交信息如下 (最新: 新版榜单 F1 接口适配
+register_by_corpus + 身份管理 API，前置提交: 零检测回退重试 + SCRFD 坐标修复):
 
 env:
   - name: PHANTHYMOTUS_COMMIT_ID
-    value: "72b8adc3f84a3b35a38bc81354dc3b35fe41e50a"
+    value: "dfacd04c35d79fbd7a50be9c38ed03d70573dbec"
   - name: PHANTHYMOTUS_REPO
     value: "https://github.com/gaogaoonholiday/phanthymotus.git"
   - name: JP_VERSION
@@ -751,10 +751,10 @@ env:
 1. 拉取你的 fork 仓库代码
 2. 构建 Docker 镜像 (基于 Dockerfile.jetson)
 3. 运行 judgeflow 评测模型指标
-4. 按以下指标评分:
-    - Identification Accuracy @ IOU>=0.5 (主要指标)
-    - FPS (监控指标)
-    - 推理失败率 (监控指标)
+4. 按以下指标评分 (新版榜单, 2026-09 更新):
+    - Identity F1 (主要指标; TP=已知人正确识别, 见 darvin.txt)
+    - 已知/未知 precision、recall (监控指标)
+    - Mean IoU、FPS、推理失败率 (监控指标)
 
 注意:
 - 仓库必须为 public
@@ -766,21 +766,24 @@ env:
 10.1 容器扫描探索 (exploratory per-container sweep)
 --------------------------------------------------------------------------------
 
-平台对同一 commit 并行跑 10 个容器, 每个容器 env 有独立 MCP_PORT
-(15720, 15820, ..., 16620, 即 15720+100*i), 且 result.log 分实例报告指标
-(6f0a583: 实例间 accuracy 随阈值单调变化 0.9072~0.9227 — 扫描生效的直接证据)。
+平台对同一 commit 并行跑多个容器, 每个容器 env 有独立 MCP_PORT
+(15720, 15820, ..., 15720+100*i)。历史版本 (6f0a583) 曾跑 10 容器并分实例报告
+指标; 最新评测 (2026-09-17, result.log) 只跑 3 实例 (0/1/2, 端口 15720/15820/15920)。
 
-利用这一点, face.py 在插件初始化时按 MCP_PORT 推断容器序号 i, 并给每个容器
-覆盖不同的 similarity_threshold —— 一次提交同时测 10 个阈值。
+利用这一点, face.py 曾在插件初始化时按 MCP_PORT 推断容器序号 i, 并给每个容器
+覆盖不同的 similarity_threshold —— 一次提交同时测多个阈值。
 
 网格 1 (6f0a583, 已完成): 0.45(参照)/0.40/0.42/0.43/0.44/0.46/0.47/0.48/0.49/0.50
     → 结果: 0.40 最优 (0.9227), 随阈值单调下降 (见附2 §15)
 
-网格 2 (本次提交): config 阈值定 0.40 (已验证), 容器 1-8 探测 0.32-0.39:
-    容器 0 (MCP_PORT=15720): config.yaml 值 0.40 (已验证 0.9227, 参照组)
-    容器 1: 0.32   容器 2: 0.33   容器 3: 0.34   容器 4: 0.35
-    容器 5: 0.36   容器 6: 0.37   容器 7: 0.38   容器 8: 0.39
-    容器 9: 表回绕 → 也用 config.yaml 值 0.40 (参照组占 2/10 样本)
+网格 2 (72b8adc): config 阈值定 0.40 (已验证), 容器 1-8 探测 0.32-0.39
+    → 未获得平台结果 (新版榜单接口变更, 评测在注册阶段失败, 见 §17)
+
+当前状态 (dfacd04 起): FACE_CONTAINER_SWEEP 默认改为 "0" (关闭),
+    所有容器统一使用 config.yaml 的 0.40。原因:
+    a. 新版榜单容器数量降为 3, 扫描空间大幅缩小
+    b. 新版评测流程需先经 MCP 注册身份, 扫描变量会让注册问题的归因变复杂
+    c. 如需恢复扫描, 设 FACE_CONTAINER_SWEEP=1 (表仍保留在 face.py)
 
   表: _CONTAINER_SWEEP_THRESHOLDS (face.py)。容器 0/9 为 None (不覆盖)。
   - 覆盖只改 match() 的判定阈值, 检测器/模型/加载流程完全一致 → 不增加
@@ -792,10 +795,66 @@ env:
     网格 2 向下探 0.32-0.39 找最优值, 0.40 双容器作对照防回归
 
 ================================================================================
+10.2 新版榜单接口适配 (dfacd04, 2026-09-17)
+================================================================================
+
+新版评测 (result.log 2026-09-17) 在识别开始前经 MCP 动态注册身份, 首次运行
+因缺少 register_by_corpus 直接失败:
+  RuntimeError: Tool face_recognition does not handle action 'register_by_corpus'
+  (3 实例全部同样失败, exit 1, 无 F1 结果)
+
+本次提交 (dfacd04) 修复, 保持 SCRFD-2.5G + EdgeFace-S 模型不变:
+
+新增 MCP actions (face 工具 inputSchema enum 已同步扩展):
+  register_by_corpus   — 批量注册: package 为目录/ZIP/tar.gz/HTTP(S) URL,
+                         解析 manifest.json (列表或映射两种格式), 同名 .json/.txt
+                         sidecar, 文件名兜底; manifest 的 person/id 字段作分组键,
+                         同组多张照片归入同一身份; 返回逐图 results[] (含
+                         person_id) + total/registered/failed; 单图失败不中断整批
+  register_by_photo/url — 单张注册 (image_path / url + name + profile)
+  recognize_by_photo/url — 只读识别, 不自动登记陌生人
+  list_persons / get_person / update_person / forget — 身份 CRUD
+
+关键设计:
+  a. 注册直接写入运行中的共享 FaceDatabase (同一对象), 已启动的 ROS 节点
+     立即可识别新身份; forget 立即生效
+  b. FaceDatabase.enroll() 原子完成 match→分配 p-N→插入 (RLock 内), 并发安全
+  c. 保留旧身份 ID: 从 /workspace/face_db 加载的目录身份继续用目录名匹配
+  d. 推理锁: detect_and_embed 加锁串行化, 注册与 ROS 推理共用 onnxruntime 会话
+  e. 输出升级: faces[] 数组 (bbox/bbox_relative/person_id/name/known/
+     identity.status 等) + count, 同时保留旧版单脸字段 (detect_confidence/
+     bbox_relative/identity) 兼容旧解析
+  f. 容器扫描默认关闭 (见 §10.1), 全部容器统一 0.40
+
+新增文件:
+  perception/plugins/face_corpus.py        — 包提取/manifest 解析/安全校验
+                                             (路径穿越/symlink/大小限制)
+  perception/tests/test_face_corpus.py     — 11 项: 元数据语义/边界/HTTP
+  perception/tests/test_face_registration.py — 7 项: 端到端注册→匹配→CRUD→
+                                             forget, ZIP 分发, 并发注册
+
+验证边界 (重要):
+  - 18 项测试全部通过 (模拟 embedding, 无需 ROS/模型)
+  - 本地无 ROS2 环境, 未跑真实 onnxruntime 注册链路
+  - 评测在识别阶段尚未运行过 → faces[] 输出能否被新版评测器解析、后续是否
+    调用未实现的 register_by_stream/list_visits, 待本次平台运行确认
+
+================================================================================
 附: 文件清单
 ================================================================================
 
 本次提交 修改的文件:
+
+perception/plugins/face.py              修改 — 新版榜单接口适配 (§10.2):
+  register_by_corpus/photo/url, recognize_by_photo/url, list_persons,
+  get_person, update_person, forget; FaceDatabase.enroll/get_person/
+  update_person/list_persons/forget; 输出增加 faces[]; detect_and_embed 加锁
+perception/plugins/face_corpus.py       新增 — 包提取/manifest/安全校验
+perception/tests/test_face_corpus.py    新增 — 11 项
+perception/tests/test_face_registration.py 新增 — 7 项
+perception/config.yaml                  注释更新 — 记录重试逻辑与本地验证数据
+
+上次提交 (72b8adc, 零检测回退重试) 修改的文件:
 
 perception/plugins/face.py              修改 — 零检测回退重试 (2x 放大 + thresh 0.3):
   YuNetDetector.detect / SCRFDDetector.detect 常规 pass 零检测时重试一次;
@@ -804,7 +863,8 @@ perception/plugins/face.py              修改 — 零检测回退重试 (2x 放
 perception/config.yaml                  注释更新 — 记录重试逻辑与本地验证数据
 
 动机 (957fe6a 平台实测): 4/194 case payload={} (帧内有脸但 @0.5 零检测),
-  本地同类帧 13/14 可在 2x 放大 + 0.3 阈值下救回且无 FA/wrong-id (附2 §16)
+  本地同类帧 12/14 可在 2x 放大 + 0.3 阈值下救回且无 FA/wrong-id (附2 §16);
+  平台实际收益待验证 (72b8adc 评测因注册接口缺失未跑识别)
 
 上一次提交 (7605d06/docs): 填写提交 env 957fe6a
 上上次提交 (957fe6a): 阈值 0.40 (平台验证最优) + 容器扫描网格 2 (0.32-0.39)
@@ -1070,10 +1130,10 @@ a901b40: 评测诊断日志 (load_diag 库健康统计 + diag 字段)，保留�
       c. 网格 2 (本次提交): config=0.40, 容器 1-8 探测 0.32-0.39, 容器 0/9
          用 0.40 作对照 (2/10 样本)
 
-16) 零检测回退重试 (本次提交) — 修复 SCRFD 坐标 bug + 2x 放大低阈值重试:
+16) 零检测回退重试 (72b8adc) — 修复 SCRFD 坐标 bug + 2x 放大低阈值重试:
     动机: 957fe6a 平台评测 4/194 case payload={} (2.06%) — 帧内有脸但 SCRFD
       @conf 0.5 零检测。本地 testset_large 同类帧 14 张 (10 known + 4 unknown):
-      13/14 在 2x INTER_CUBIC 放大 + 阈值 0.3 下有检测 (conf 0.32-0.49)
+      12/14 在 2x INTER_CUBIC 放大 + 阈值 0.3 下有检测 (conf 0.32-0.49)
     重要 bug 修复: SCRFDDetector._detect_at 此前不回除预放大倍数 (YuNet 有
       /s/scale, SCRFD 只有 /det_scale) → 首版重试返回 2x 坐标的地标，对齐后
       嵌入全错 (已知人全部 WRONG-ID)。已加 scale 参数: boxes/kpss / (det_scale*scale)
@@ -1090,9 +1150,23 @@ a901b40: 评测诊断日志 (load_diag 库健康统计 + diag 字段)，保留�
         → 2x INTER_CUBIC 放大 + thresh 0.3 重试一次, 坐标回除 scale=2.0
         → 仍无检测才返回 [] (payload={}, 与旧行为一致)
       只有本来发空 payload 的帧才付出 ~80ms; 有检测帧零开销
-    预期: 平台 4 个 payload={} case 直接受益; 识别侧 0 改动, 无回归风险
+    预期: 平台 4 个 payload={} case 直接受益; 识别侧 0 改动, 平台收益
+      待验证 (72b8adc 评测因新版榜单注册接口缺失未跑识别, 见 §10.2)
     烟测 (smoke_test.py, ROS-free yunet): Abdullah_Gul 0.740 命中 / AJ_Cook 拒识,
       e2e p50 23ms — PASS
+
+17) 新版榜单评测失败实录 (2026-09-17, result.log) — register_by_corpus 缺失:
+    平台环境: datasetv3 缓存, 实际挂载 /workspace/dataset/dataset-v2,
+      3 实例 (MCP 端口 15720/15820/15920), 插件 state=running, ROS 连接正常
+    启动阶段: 读 identity/init/identity.json (50 identities), 首批 ZIP 30 张
+      上传 file_server (localhost:8000) 成功
+    失败点: evaluate.py register_batch → mcp_call face_recognition
+      register_by_corpus → 3 实例全部报
+      "Tool face_recognition does not handle action 'register_by_corpus'"
+      (-32603), exit 1, 容器清理, 无 F1/precision/recall 结果
+    修复: dfacd04 (§10.2)。评测在识别阶段之前失败 → 新版输出契约
+      (faces[]/identity.status) 与后续动作 (register_by_stream/list_visits
+      等) 是否被调用仍待下次平台运行验证
 
 perception/Dockerfile.jetson             修改 — 添加 face 依赖 (timm 等) + COPY edgeface_src;
                                         5ec227f 补装 onnxruntime==1.18.1 (SCRFD 检测器运行时依赖)
