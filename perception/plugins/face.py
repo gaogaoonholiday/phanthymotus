@@ -39,6 +39,7 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
 from utils.ros_lifecycle import dispose_node
+from plugins.face_corpus import corpus_entries, load_image
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ DEFAULT_MODEL_NAME = "edgeface_s_gamma_05"  # 3.65M params, ~14MB checkpoint (ev
 # separately (result.log: "实例 i: accuracy=..."). One submission can therefore
 # A/B multiple parameter sets in a single eval instead of one config per day.
 #
-# FACE_CONTAINER_SWEEP (default "1" on the platform, set "0" to disable):
+# FACE_CONTAINER_SWEEP (default "0"; set "1" to opt into the historical sweep):
 #   container index i = (MCP_PORT - 15720) // 100. Container 0 always uses the
 #   config.yaml values (the reference config); index >= 1 overrides
 #   similarity_threshold from the table below, so all 10 containers run
@@ -92,7 +93,7 @@ def _container_index() -> int | None:
 
 def _container_sweep_overrides() -> dict:
     """Parameter overrides for this container; {} for container 0 / non-platform."""
-    if os.environ.get("FACE_CONTAINER_SWEEP", "1").strip().lower() in ("0", "false", "off"):
+    if os.environ.get("FACE_CONTAINER_SWEEP", "0").strip().lower() in ("0", "false", "off"):
         return {}
     idx = _container_index()
     if idx is None:
@@ -127,9 +128,25 @@ TOOLS = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["start", "stop", "info", "config"],
+                    "enum": ["start", "stop", "info", "config",
+                             "register_by_corpus", "register_by_photo", "register_by_url",
+                             "recognize_by_photo", "recognize_by_url",
+                             "list_persons", "get_person", "update_person", "forget"],
                     "description": "Action to perform"
                 },
+                "package": {"type": "string", "description": "Directory, ZIP or tar.gz path/URL"},
+                "image_path": {"type": "string"},
+                "url": {"type": "string"},
+                "name": {"type": "string"},
+                "profile": {"type": ["object", "string"]},
+                "person_id": {"type": "string"},
+                "person_ids": {"type": ["array", "string"], "items": {"type": "string"}},
+                "profile_delete": {"type": "array", "items": {"type": "string"}},
+                "merge": {"type": "boolean", "default": True},
+                "named": {"type": "string", "enum": ["all", "named", "unknown"]},
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "default": 100},
+                "offset": {"type": "integer", "minimum": 0},
                 "input_topic": {
                     "type": "string",
                     "description": "ROS2 image topic to subscribe (e.g. /hostname/camera/rgb, required for action=start)"
@@ -247,6 +264,167 @@ class FaceDatabase:
         self._embeddings: dict[str, list[np.ndarray]] = {}
         self._lock = threading.RLock()
         self.load_diag: Optional[str] = None
+        self._persons: dict[str, dict] = {}
+        self._next_person_id = 1
+
+    @staticmethod
+    def _clean_profile(profile):
+        import json
+
+        if profile is None:
+            return {}
+        if isinstance(profile, str):
+            return {"note": profile.strip()} if profile.strip() else {}
+        if not isinstance(profile, dict):
+            raise ValueError("profile must be a JSON object")
+        try:
+            return json.loads(json.dumps(profile, ensure_ascii=False))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"profile is not JSON-serialisable: {error}") from error
+
+    def _reserve_ids_locked(self):
+        """Retain the allocation high-water mark, including legacy gallery ids."""
+        for pid in self._embeddings:
+            if pid.startswith("p-") and pid[2:].isdigit():
+                self._next_person_id = max(self._next_person_id, int(pid[2:]) + 1)
+
+    def _record_locked(self, pid):
+        from copy import deepcopy
+
+        if pid not in self._embeddings:
+            raise KeyError(pid)
+        person = self._persons.setdefault(pid, {
+            "id": pid, "name": pid, "profile": {}, "named": bool(pid.strip()),
+            "samples": 0,
+        })
+        person["samples"] = len(self._embeddings[pid])
+        return deepcopy(person)
+
+    def enroll(self, embedding, name='', profile=None, person_id=None, threshold=0.4):
+        """Match, allocate and insert one sample atomically in the live gallery."""
+        with self._lock:
+            clean_profile = self._clean_profile(profile)
+            name = str(name or '').strip()
+            pid = str(person_id or '').strip()
+            if pid and pid not in self._embeddings:
+                return {"ok": False, "reason": "bad_input",
+                        "detail": f"no such person: {pid!r}"}
+            sample = np.array(embedding, dtype=np.float32, copy=True)
+            if (sample.ndim != 1 or not sample.size or
+                    not np.isfinite(sample).all() or np.linalg.norm(sample) == 0):
+                raise ValueError("embedding must be a finite, nonzero vector")
+            if any(sample.shape != np.asarray(v).shape
+                   for samples in self._embeddings.values() for v in samples):
+                raise ValueError("embedding dimension does not match the gallery")
+            self._reserve_ids_locked()
+            score = None
+            explicit = bool(pid)
+            if not explicit:
+                matched, score = self.match(sample, threshold)
+                pid = matched if matched != "unknown" else ''
+            merged = bool(pid)
+            promoted = False
+            if merged:
+                existing = self._record_locked(pid)
+                # Automatic matches preserve names; explicit ids permit renaming.
+                if name and (explicit or not existing["named"]):
+                    existing["name"] = name
+                    promoted = not existing["named"]
+                    existing["named"] = True
+                if profile is not None:
+                    existing["profile"].update(clean_profile)
+                self._persons[pid] = existing
+            else:
+                pid = f"p-{self._next_person_id}"
+                self._next_person_id += 1
+                self._persons[pid] = {
+                    "id": pid, "name": name, "profile": clean_profile,
+                    "named": bool(name), "samples": 0,
+                }
+            self._embeddings.setdefault(pid, []).append(sample)
+            record = self._record_locked(pid)
+            return {
+                "ok": True, "person_id": pid, "name": record["name"],
+                "profile": record["profile"], "samples": record["samples"],
+                "merged": merged, "promoted": promoted,
+                "score_to_existing": round(float(score), 4) if score is not None else None,
+            }
+
+    def get_person(self, pid):
+        """Return independent metadata; raise KeyError for an absent identity."""
+        with self._lock:
+            return self._record_locked(pid)
+
+    def update_person(self, pid, name=None, profile=None, profile_delete=None, merge=True):
+        with self._lock:
+            record = self._record_locked(pid)
+            if name is not None:
+                record["name"] = str(name).strip()
+                record["named"] = bool(record["name"])
+            if profile is not None:
+                cleaned = self._clean_profile(profile)
+                record["profile"] = {**record["profile"], **cleaned} if merge else cleaned
+            for key in (profile_delete or []):
+                record["profile"].pop(str(key), None)
+            self._persons[pid] = record
+            return self._record_locked(pid)
+
+    def list_persons(self, named='all', query='', limit=100, offset=0):
+        import json
+
+        with self._lock:
+            wanted = str(named or 'all').strip().lower()
+            needle = str(query or '').strip().lower()
+            records = [self._record_locked(pid) for pid in self._embeddings]
+            if wanted in ('named', 'unknown'):
+                records = [r for r in records if r["named"] == (wanted == 'named')]
+            if needle:
+                records = [r for r in records if needle in ' '.join([
+                    r["id"], r["name"], json.dumps(r["profile"], ensure_ascii=False),
+                ]).lower()]
+            records.sort(key=lambda r: not r["named"])
+            limit, offset = int(limit), max(0, int(offset))
+            end = offset + max(0, limit) if limit else len(records)
+            return {"persons": records[offset:end], "total": len(records),
+                    "limit": limit, "offset": offset}
+
+    def forget(self, person_id=None, person_ids=None, named=None):
+        """Delete live gallery samples, returning the upstream tool result."""
+        import re
+
+        with self._lock:
+            self._reserve_ids_locked()
+            raw_ids = person_ids or []
+            if isinstance(raw_ids, str):
+                raw_ids = re.split(r"[,\s]+", raw_ids)
+            ids = [str(pid).strip() for pid in raw_ids if str(pid).strip()]
+            single = str(person_id or '').strip()
+            if single:
+                ids.append(single)
+            unknown_scope = str(named or '').strip().lower() == 'unknown' and not ids
+            if unknown_scope:
+                ids = [pid for pid in self._embeddings
+                       if not self._record_locked(pid)["named"]]
+            elif not ids:
+                raise ValueError("person_id, person_ids or named='unknown' is required")
+            forgotten, missing = [], []
+            for pid in dict.fromkeys(ids):
+                if pid in self._embeddings:
+                    del self._embeddings[pid]
+                    self._persons.pop(pid, None)
+                    forgotten.append(pid)
+                else:
+                    missing.append(pid)
+            if unknown_scope:
+                return {"ok": True, "forgotten": len(forgotten), "scope": "unknown"}
+            result = {"ok": bool(forgotten) or not missing,
+                      "forgotten": len(forgotten), "person_ids": forgotten}
+            if missing:
+                result["missing"] = missing
+                result["detail"] = f"{len(missing)} id(s) did not exist: " + ', '.join(missing)
+                if not forgotten:
+                    result["reason"] = "bad_input"
+            return result
 
     def load_from_dir(self, db_dir: str, adapter: "EdgeFaceAdapter"):
         """Load identity library: detect + embed all faces in db_dir."""
@@ -256,7 +434,9 @@ class FaceDatabase:
             return
 
         with self._lock:
+            self._reserve_ids_locked()
             self._embeddings.clear()
+            self._persons.clear()
             n_dirs = n_images = n_fail = 0
 
             for person_dir in sorted(db_path.iterdir()):
@@ -286,6 +466,7 @@ class FaceDatabase:
                         n_fail += 1
                         log.warning(f"[face] failed to load {img_file}: {e}")
 
+            self._reserve_ids_locked()
             total = sum(len(v) for v in self._embeddings.values())
             log.info(f"[face] face db loaded: {len(self._embeddings)} persons, {total} embeddings")
 
@@ -309,10 +490,11 @@ class FaceDatabase:
                 mask &= ids_arr[:, None] != ids_arr[None, :]
                 mask &= np.triu(np.ones_like(mask, dtype=bool))
                 impostor = S[mask]
-                self.load_diag += (
-                    f" imp mean={impostor.mean():.3f} med={float(np.median(impostor)):.3f}"
-                    f" p95={float(np.percentile(impostor, 95)):.3f} max={float(impostor.max()):.3f}"
-                )
+                if impostor.size:
+                    self.load_diag += (
+                        f" imp mean={impostor.mean():.3f} med={float(np.median(impostor)):.3f}"
+                        f" p95={float(np.percentile(impostor, 95)):.3f} max={float(impostor.max()):.3f}"
+                    )
                 pairs = sorted(
                     ((float(S[i, j]), ids[i], ids[j]) for i, j in np.argwhere(mask)),
                     reverse=True,
@@ -650,6 +832,7 @@ class EdgeFaceAdapter:
 
         # ── Load EdgeFace backbone via ONNX Runtime ──
         self._model_name = model_name
+        self._inference_lock = threading.Lock()
         so = ort.SessionOptions()
         so.intra_op_num_threads = 2
         so.inter_op_num_threads = 1
@@ -673,6 +856,11 @@ class EdgeFaceAdapter:
             log.info(f"[face] SCRFD ({detector}) loaded, conf={confidence}")
 
     def detect_and_embed(self, image: np.ndarray) -> list[dict]:
+        # Registration and ROS workers share detector state.
+        with self._inference_lock:
+            return self._detect_and_embed(image)
+
+    def _detect_and_embed(self, image: np.ndarray) -> list[dict]:
         """Detect faces, align, extract embeddings.
 
         Args:
@@ -840,6 +1028,14 @@ class _FaceNode(Node):
                         "diag": diag,
                     }
 
+                faces = [_face_result(self._face_db, det, frame.shape, self._similarity_threshold)
+                         for det in detections]
+                result.update({"ts": time.time(), "count": len(faces), "faces": faces,
+                               "image_size": {"width": W, "height": H}})
+                if faces:
+                    best = max(faces, key=lambda face: face["detect_confidence"])
+                    result.update({key: best[key] for key in
+                                   ("detect_confidence", "bbox_relative", "identity")})
                 msg = String()
                 msg.data = json.dumps(result, ensure_ascii=False)
                 self._pub.publish(msg)
@@ -850,6 +1046,28 @@ class _FaceNode(Node):
 
             except Exception as e:
                 log.error(f"[face] inference error: {e}", exc_info=True)
+
+
+def _face_result(database, detection, shape, threshold):
+    height, width = shape[:2]
+    x1, y1, x2, y2 = detection["bbox"]
+    with database._lock:
+        person_id, score = database.match(np.asarray(detection["embedding"]), threshold)
+        record = database.get_person(person_id) if person_id != "unknown" else None
+    known = bool(record and record["named"])
+    return {
+        "bbox": [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
+        "bbox_relative": [float(x1 / width), float(y1 / height),
+                          float((x2 - x1) / width), float((y2 - y1) / height)],
+        "det_score": float(detection["confidence"]),
+        "detect_confidence": float(detection["confidence"]),
+        "person_id": person_id if record else None,
+        "name": record["name"] if record else "",
+        "profile": record["profile"] if record else {},
+        "known": known, "score": float(score), "quality": "ok",
+        "identity": {"status": "known" if known else "unknown",
+                     "person_id": person_id if known else "unknown", "confidence": float(score)},
+    }
 
 
 # ── Plugin class ──────────────────────────────────────────────────────────────
@@ -878,6 +1096,7 @@ class FaceRecognitionPlugin:
         self._model_loading = False
         self._model_load_error = None
         self._model_lock = threading.Lock()
+        self._max_batch = int(plugin_cfg.get("max_batch", 1000))
         self._pending_starts: list[tuple[str, str]] = []
 
         self._face_db = FaceDatabase()
@@ -921,19 +1140,18 @@ class FaceRecognitionPlugin:
 
     def _ensure_model(self):
         """Load model and identity library in background."""
-        if self._model is not None:
-            return
         with self._model_lock:
             if self._model is not None:
                 return
 
-            self._model = EdgeFaceAdapter(
+            model = EdgeFaceAdapter(
                 self._model_name, self._model_dir, self._device,
                 confidence=self._confidence, detector=self._detector,
             )
 
             # Load identity library
-            self._face_db.load_from_dir(self._face_db_dir, self._model)
+            self._face_db.load_from_dir(self._face_db_dir, model)
+            self._model = model
 
     def _start_node(self, node_key: str, input_topic: str):
         """Create and start a FaceNode for the given topic."""
@@ -949,12 +1167,86 @@ class FaceRecognitionPlugin:
         node.start()
         log.info(f"[face] node started (background): {input_topic}")
 
+    def _register_image(self, image, name="", profile=None, person_id=None):
+        detections = self._model.detect_and_embed(image)
+        if not detections:
+            return {"ok": False, "reason": "no_face", "detail": "no face detected"}
+        detections.sort(key=lambda d: max(0, d["bbox"][2] - d["bbox"][0]) *
+                        max(0, d["bbox"][3] - d["bbox"][1]), reverse=True)
+        if len(detections) > 1:
+            areas = [(d["bbox"][2] - d["bbox"][0]) *
+                     (d["bbox"][3] - d["bbox"][1]) for d in detections[:2]]
+            if areas[0] < 1.5 * areas[1]:
+                return {"ok": False, "reason": "ambiguous", "detail": "multiple comparable faces"}
+        return self._face_db.enroll(
+            detections[0]["embedding"], name=name, profile=profile,
+            person_id=person_id, threshold=self._similarity_threshold,
+        )
+
+    def _register_corpus(self, args):
+        package = str(args.get("package") or "").strip()
+        if not package:
+            return {"ok": False, "reason": "bad_input", "detail": "package is required"}
+        self._ensure_model()
+        results, groups = [], {}
+        try:
+            with corpus_entries(package, self._max_batch) as entries:
+                for relative, path, name, profile, group in entries:
+                    try:
+                        outcome = self._register_image(
+                            load_image(path), name, profile, groups.get(group) if group else None,
+                        )
+                    except Exception as error:
+                        log.warning("[face] registration failed for %s: %s", relative, error)
+                        outcome = {"ok": False, "reason": "bad_input", "detail": str(error)}
+                    if outcome.get("ok") and group:
+                        groups.setdefault(group, outcome["person_id"])
+                    results.append({"file": relative, "name": name, **outcome})
+        except (ValueError, OSError) as error:
+            return {"ok": False, "reason": "bad_input", "detail": str(error)}
+        registered = sum(bool(item.get("ok")) for item in results)
+        return {"ok": True, "source": package, "total": len(results),
+                "registered": registered, "failed": len(results) - registered, "results": results}
+
+    def _identity_action(self, action, args):
+        self._ensure_model()
+        try:
+            if action == "list_persons":
+                return {"ok": True, **self._face_db.list_persons(
+                    named=args.get("named") or "all", query=args.get("query") or "",
+                    limit=int(args.get("limit", 100)), offset=int(args.get("offset", 0)))}
+            if action == "get_person":
+                return {"ok": True, "person": self._face_db.get_person(args.get("person_id", ""))}
+            if action == "update_person":
+                return {"ok": True, "person": self._face_db.update_person(
+                    args.get("person_id", ""), name=args.get("name"), profile=args.get("profile"),
+                    profile_delete=args.get("profile_delete"), merge=args.get("merge", True))}
+            if action == "forget":
+                return self._face_db.forget(person_id=args.get("person_id"),
+                                            person_ids=args.get("person_ids"), named=args.get("named"))
+            source = args.get("url") if action.endswith("_url") else args.get("image_path")
+            image = load_image(source, is_url=action.endswith("_url"))
+            if action.startswith("register_"):
+                return {**self._register_image(image, args.get("name") or "", args.get("profile")),
+                        "source": source}
+            faces = [_face_result(self._face_db, d, image.shape, self._similarity_threshold)
+                     for d in self._model.detect_and_embed(image)]
+            return {"ok": True, "source": source, "count": len(faces), "faces": faces}
+        except (ValueError, TypeError, KeyError, OSError) as error:
+            return {"ok": False, "reason": "bad_input", "detail": str(error)}
+
     def get_tools(self) -> list:
         return TOOLS
 
     def dispatch(self, name: str, args: dict) -> dict | None:
         action = args.get("action", name)
         instance_id = args.get("instance_id", "")
+
+        if action == "register_by_corpus":
+            return self._register_corpus(args)
+        if action in ("register_by_photo", "register_by_url", "recognize_by_photo",
+                      "recognize_by_url", "list_persons", "get_person", "update_person", "forget"):
+            return self._identity_action(action, args)
 
         if action == "info":
             if self._model_loading:

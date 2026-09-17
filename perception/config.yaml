@@ -104,11 +104,11 @@ plugins:
                                  # (0.40) accuracy 0.9227 vs 0.9175 @0.42-0.44, 0.9124
                                  # @0.45-0.47, 0.9072 @0.48-0.50 — eval domain prefers
                                  # lower thresholds than LFW (local optimum was 0.45)
-                                 # NOTE: per-container exploratory sweep overrides this
+                                 # Optional per-container sweep (disabled by default) overrides this
                                  # (FACE_CONTAINER_SWEEP=1) — see face.py _container_sweep
     confidence: 0.5               # det score threshold; frames with zero dets get
                                   # one automatic retry @0.3 on a 2x-upscaled image
-                                  # (rescues payload={} frames: local 13/14 no-det
+                                  # (rescues payload={} frames: local 12/14 no-det
                                   # images recovered, 0 FA / 0 wrong-id; ~80ms only
                                   # on those frames)
     fps: 3
