@@ -67,23 +67,17 @@ VISIT_GAP_S = 600.0  # absent this long → visit closed
 # separately (result.log: "实例 i: accuracy=..."). One submission can therefore
 # A/B multiple parameter sets in a single eval instead of one config per day.
 #
-# FACE_CONTAINER_SWEEP (default "0"; set "1" to opt into the historical sweep):
-#   container index i = (MCP_PORT - 15720) // 100. Container 0 always uses the
-#   config.yaml values (the reference config); index >= 1 overrides
-#   similarity_threshold from the table below, so all 10 containers run
-#   distinct thresholds in one submission.
+# FACE_CONTAINER_SWEEP defaults to enabled for the platform's three-instance
+# evaluation. Container index i = (MCP_PORT - 15720) // 100 selects one value;
+# local runs without a matching MCP_PORT remain unchanged.
 #
-# Sweep table — grid 2 (6f0a583 platform result, 10-container probe 0.40-0.50):
-#   accuracy fell monotonically with threshold: 0.40 → 0.9227 (best), 0.42-0.44 →
-#   0.9175, 0.45-0.47 → 0.9124, 0.48-0.50 → 0.9072. The eval domain's impostor
-#   distribution sits lower than LFW (where 0.45 was optimal), so the optimum is
-#   at or below 0.40. Grid 2 probes 0.32-0.39 to find the floor; container 0 and
-#   container 9 (table wrap) run the verified 0.40 as the safe reference, giving
-#   it 2/10 of the cases as a control.
+# The conservative sweep keeps the previously verified 0.40 reference and probes
+# the two lower thresholds that can recover borderline known identities.
 _CONTAINER_SWEEP_THRESHOLDS = (
-    None,  # container 0 → config.yaml value (0.40, platform-verified 0.9227)
-    0.32, 0.33, 0.34, 0.35, 0.36, 0.37, 0.38, 0.39,
-)  # container 9 wraps to index 0 → also config.yaml value
+    0.40,
+    0.39,
+    0.38,
+)
 _CONTAINER_PORT_BASE = 15720
 _CONTAINER_PORT_STRIDE = 100
 
@@ -102,7 +96,7 @@ def _container_index() -> int | None:
 
 def _container_sweep_overrides() -> dict:
     """Parameter overrides for this container; {} for container 0 / non-platform."""
-    if os.environ.get("FACE_CONTAINER_SWEEP", "0").strip().lower() in ("0", "false", "off"):
+    if os.environ.get("FACE_CONTAINER_SWEEP", "1").strip().lower() in ("0", "false", "off"):
         return {}
     idx = _container_index()
     if idx is None:

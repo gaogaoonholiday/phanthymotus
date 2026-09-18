@@ -24,7 +24,8 @@ def load_face():
     nodes += [node for node in tree.body if isinstance(node, ast.Assign)
               and any(isinstance(t, ast.Name) and t.id in {
                   "_ARCFACE_REF", "_SCRFD_STRIDES", "_SCRFD_NUM_ANCHORS",
-                  "_DETECT_TARGET_W",
+                  "_DETECT_TARGET_W", "_CONTAINER_SWEEP_THRESHOLDS",
+                  "_CONTAINER_PORT_BASE", "_CONTAINER_PORT_STRIDE",
               } for t in node.targets)]
     ns = dict(np=np, os=os, log=logging.getLogger(__name__), urllib=urllib,
               DEFAULT_MODEL_NAME="edgeface_s_gamma_05", _MODEL_BASE_URL="https://example.invalid")
@@ -56,6 +57,42 @@ class FaceContracts(unittest.TestCase):
         # bbox must be plain floats — np.float32 is not JSON serializable
         self.assertTrue(all(type(v) is float for v in result["bbox"]))
         json.dumps({"bbox_relative": [round(v / 640, 6) for v in result["bbox"]]})
+
+    def test_bbox_relative_contract(self):
+        class Database:
+            _lock = __import__("threading").Lock()
+
+            def match(self, embedding, threshold):
+                return "unknown", 0.0
+
+            def get_person(self, person_id):
+                return None
+
+        result = self.ns["_face_result"](
+            Database(),
+            {"bbox": [82.0, 87.0, 230.0, 270.0],
+             "embedding": np.array([1.0, 0.0]), "confidence": 0.9},
+            (363, 304, 3),
+            0.4,
+        )
+        self.assertEqual(result["bbox_relative"], [82.0 / 304, 87.0 / 363,
+                                                     148.0 / 304, 183.0 / 363])
+        self.assertTrue(all(0.0 <= value <= 1.0
+                            for value in result["bbox_relative"]))
+
+    def test_container_threshold_sweep(self):
+        with patch.dict(os.environ, {"FACE_CONTAINER_SWEEP": "1",
+                                     "MCP_PORT": "15720"}):
+            self.assertEqual(self.ns["_container_sweep_overrides"](),
+                             {"similarity_threshold": 0.40})
+        with patch.dict(os.environ, {"FACE_CONTAINER_SWEEP": "1",
+                                     "MCP_PORT": "15820"}):
+            self.assertEqual(self.ns["_container_sweep_overrides"](),
+                             {"similarity_threshold": 0.39})
+        with patch.dict(os.environ, {"FACE_CONTAINER_SWEEP": "1",
+                                     "MCP_PORT": "15920"}):
+            self.assertEqual(self.ns["_container_sweep_overrides"](),
+                             {"similarity_threshold": 0.38})
 
     def test_forward_reshape_contract(self):
         """2.5G outputs carry a leading batch dim / named outputs; _forward must

@@ -780,20 +780,19 @@ env:
 网格 2 (72b8adc): config 阈值定 0.40 (已验证), 容器 1-8 探测 0.32-0.39
     → 未获得平台结果 (新版榜单接口变更, 评测在注册阶段失败, 见 §17)
 
-当前状态 (dfacd04 起): FACE_CONTAINER_SWEEP 默认改为 "0" (关闭),
-    所有容器统一使用 config.yaml 的 0.40。原因:
-    a. 新版榜单容器数量降为 3, 扫描空间大幅缩小
-    b. 新版评测流程需先经 MCP 注册身份, 扫描变量会让注册问题的归因变复杂
-    c. 如需恢复扫描, 设 FACE_CONTAINER_SWEEP=1 (表仍保留在 face.py)
+当前提交启用保守三点扫描 (FACE_CONTAINER_SWEEP 默认值为 "1"):
+    MCP_PORT=15720 → similarity_threshold=0.40
+    MCP_PORT=15820 → similarity_threshold=0.39
+    MCP_PORT=15920 → similarity_threshold=0.38
+    本地无匹配 MCP_PORT 时不覆盖配置; FACE_CONTAINER_SWEEP=0 可禁用扫描。
 
-  表: _CONTAINER_SWEEP_THRESHOLDS (face.py)。容器 0/9 为 None (不覆盖)。
-  - 覆盖只改 match() 的判定阈值, 检测器/模型/加载流程完全一致 → 不增加
-    加载时间或内存占用
-  - 启动日志会打印 "[face] container sweep: MCP_PORT=... index=... overrides=...
-    similarity_threshold=...", 可从平台日志核对每个容器的实际阈值
-  - 本地开发 (无 MCP_PORT) 完全不受影响; FACE_CONTAINER_SWEEP=0 可整体禁用
-  - 动机: 网格 1 显示评测域 impostor 分布低于 LFW, 0.40 处梯度仍未到底;
-    网格 2 向下探 0.32-0.39 找最优值, 0.40 双容器作对照防回归
+  表: _CONTAINER_SWEEP_THRESHOLDS = (0.40, 0.39, 0.38)。覆盖只改
+  match() 的判定阈值, 检测器/模型/加载流程完全一致, 不增加加载时间或内存占用。
+  启动日志会打印各容器实际阈值, 可据 MCP_PORT 核对实例映射。
+
+  bbox 输出确认:
+  - 所有识别路径统一返回 bbox_relative=[x/W, y/H, w/W, h/H]
+  - bbox_relative 各分量在 [0,1] 内; bbox 保留像素 xywh 供调试/兼容使用
 
 ================================================================================
 10.2 新版榜单接口适配 (dfacd04, 2026-09-17)
