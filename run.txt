@@ -728,12 +728,12 @@ curl -s http://localhost:15720 -X POST \
 10. 榜单提交
 ================================================================================
 
-代码已提交，仓库已设为 public，提交信息如下 (最新: 启用保守三实例阈值扫描并确认归一化 bbox，
+代码已推送，仓库已设为 public，提交信息如下 (最新: 启用保守三实例阈值扫描并确认归一化 bbox，
 前置提交: 补齐新版榜单流式接口 register_by_stream/recognize_by_stream/list_visits):
 
 env:
   - name: PHANTHYMOTUS_COMMIT_ID
-    value: "1b56c74ed27603e077094aa1f957b07148fc2593"
+    value: "6ec9afdaec669505b74bae229d9c87623d1a5c54"
   - name: PHANTHYMOTUS_REPO
     value: "https://github.com/gaogaoonholiday/phanthymotus.git"
   - name: JP_VERSION
@@ -887,10 +887,45 @@ env:
   test_face_candidates + test_face_stream)
 
 ================================================================================
+10.4 保守三实例阈值扫描 (1b56c74, 2026-09-18)
+================================================================================
+
+31852ea 评测 (2026-09-17, F1=0.9471) 三实例全部使用 config 阈值 0.40。分析
+known_as_unknown=54 / unknown_as_person=2 后采用更保守的三点扫描:
+
+提交内容 (1b56c74):
+  _CONTAINER_SWEEP_THRESHOLDS = (0.40, 0.39, 0.38)
+  FACE_CONTAINER_SWEEP 默认值 "0" → "1" (平台 3 实例直接生效, 无需配置 env)
+  实例映射: MCP_PORT 15720→0.40 / 15820→0.39 / 15920→0.38
+  本地无匹配 MCP_PORT 不覆盖; FACE_CONTAINER_SWEEP=0 可禁用
+  bbox 确认: bbox_relative=[x/W,y/H,w/W,h/H] 各分量 [0,1] (已有路径不变,
+  新增测试固化契约)
+
+新增测试 (test_face_candidates.py):
+  test_bbox_relative_contract — 归一化 bbox 精确值 + [0,1] 范围断言
+  test_container_threshold_sweep — 三端口 → 三阈值映射断言
+  全套 25 项通过
+
+推送记录: 2026-09-18 首次评测因 commit 未推送而 checkout 失败
+  ("reference is not a tree"); SSH key 绑定后推送成功 (e2b9dcf→6ec9afd)。
+  6ec9afd 为文档提交 (run.txt 更新), 功能改动全在 1b56c74。
+
+================================================================================
 附: 文件清单
 ================================================================================
 
-本次提交 (31852ea) 修改的文件:
+本次提交 (1b56c74) 修改的文件:
+
+perception/plugins/face.py              修改 — 扫描表 (0.40,0.39,0.38) +
+  FACE_CONTAINER_SWEEP 默认启用
+perception/tests/test_face_candidates.py 修改 — 新增 bbox/sweep 契约测试
+  (AST 提取增加 _CONTAINER_SWEEP_THRESHOLDS 等常量)
+
+6ec9afd 修改的文件:
+
+run.txt                                 修改 — 提交信息更新为 1b56c74 全 hash
+
+上次提交 (31852ea) 修改的文件:
 
 perception/plugins/face.py              修改 — 流式接口 (§10.3): 滚动窗口
   (_image_cb 限流前记录), register_by_stream/recognize_by_stream/list_visits,
