@@ -728,13 +728,12 @@ curl -s http://localhost:15720 -X POST \
 10. 榜单提交
 ================================================================================
 
-代码已推送，仓库已设为 public，提交信息如下 (最新: 补齐新版榜单流式接口
-register_by_stream/recognize_by_stream/list_visits (darvin.txt F1 规范)，
-前置提交: register_by_corpus + 身份管理 API):
+代码已提交，仓库已设为 public，提交信息如下 (最新: 启用保守三实例阈值扫描并确认归一化 bbox，
+前置提交: 补齐新版榜单流式接口 register_by_stream/recognize_by_stream/list_visits):
 
 env:
   - name: PHANTHYMOTUS_COMMIT_ID
-    value: "31852ea"
+    value: "1b56c74ed27603e077094aa1f957b07148fc2593"
   - name: PHANTHYMOTUS_REPO
     value: "https://github.com/gaogaoonholiday/phanthymotus.git"
   - name: JP_VERSION
