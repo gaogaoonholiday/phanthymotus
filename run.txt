@@ -728,12 +728,17 @@ curl -s http://localhost:15720 -X POST \
 10. 榜单提交
 ================================================================================
 
-代码已推送，仓库已设为 public，提交信息如下 (最新: 启用保守三实例阈值扫描并确认归一化 bbox，
-前置提交: 补齐新版榜单流式接口 register_by_stream/recognize_by_stream/list_visits):
+本轮提交: EdgeFace-Base Linear INT8 + SCRFD-2.5G，总模型大小 25,646,022 字节。
+同时包含注册身份库原子持久化、重启恢复及 MCP_PORT 实例隔离。
+保持三实例阈值 0.40/0.39/0.38 与归一化 bbox；真实识别收益等待本轮评测。
+识别器下载: http://172.28.4.81:34567/face/edgeface_base.int8.onnx
+SHA256: 8a97eddb4dbba95511f4160c88957d69a75edaa288d8d93afbbaad9a7b6e997a
+31 项人脸测试通过，模型下载地址与本地文件校验和一致。
+提交信息如下:
 
 env:
   - name: PHANTHYMOTUS_COMMIT_ID
-    value: "6ec9afdaec669505b74bae229d9c87623d1a5c54"
+    value: "c5df5a91b42bc6473a3515fa3800484a788f362a"
   - name: PHANTHYMOTUS_REPO
     value: "https://github.com/gaogaoonholiday/phanthymotus.git"
   - name: JP_VERSION
