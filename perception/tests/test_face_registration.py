@@ -105,5 +105,158 @@ class RegistrationContracts(unittest.TestCase):
         self.assertEqual(roster['persons'][0]['samples'], 8)
 
 
+class PersistenceContracts(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import Mock
+
+        self.ns = load_face()
+        self.ns.update(threading=threading, Path=Path)
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.state = self.root / '.state' / 'mcp-15720' / 'state.json'
+        self.adapter = Mock()
+        self.adapter.detect_and_embed.return_value = [
+            dict(embedding=np.array([1., 0.]), confidence=.9)]
+
+    def reopen(self, model='test-model', state=None):
+        db = self.ns['FaceDatabase']()
+        db.initialize_persistence(state or self.state, model, self.root, self.adapter)
+        return db
+
+    def legacy_image(self, pid='p-8'):
+        person = self.root / pid
+        person.mkdir()
+        cv2.imwrite(str(person / 'sample.png'), np.full((10, 10, 3), 80, np.uint8))
+
+    def test_recreate_embeddings_metadata_counter_and_update(self):
+        self.legacy_image()
+        db = self.reopen()
+        self.assertEqual(db.get_person('p-8')['name'], 'p-8')
+        result = db.enroll([0., 1.], name='名字', profile={'nested': {'a': [1]}, 'old': True})
+        self.assertEqual(result['person_id'], 'p-9')
+        db.enroll([.1, 1.], person_id='p-9')
+        restored = self.reopen()
+        self.assertEqual(restored.get_person('p-9'), db.get_person('p-9'))
+        np.testing.assert_array_equal(restored._embeddings['p-9'], db._embeddings['p-9'])
+        self.assertEqual(restored.match(np.array([0., 1.]), .4)[0], 'p-9')
+        restored.update_person('p-9', name='Updated', profile={'role': 'test'}, profile_delete=['old'])
+        restored = self.reopen()
+        self.assertEqual(restored.get_person('p-9')['profile'], {'nested': {'a': [1]}, 'role': 'test'})
+        self.assertEqual(restored.get_person('p-9')['name'], 'Updated')
+        restored.update_person('p-9', name='', profile={'only': 1}, merge=False)
+        self.assertEqual(self.reopen().get_person('p-9')['profile'], {'only': 1})
+        self.assertFalse(self.reopen().get_person('p-9')['named'])
+        restored.forget(person_id='p-9')
+        self.assertEqual(self.reopen().enroll([0., 1.])['person_id'], 'p-10')
+        self.assertEqual(self.state.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(set(json.loads(self.state.read_text())),
+                         {'version', 'model_id', 'embeddings', 'persons', 'next_person_id'})
+
+    def test_forget_legacy_and_empty_library_never_reimport(self):
+        self.legacy_image()
+        db = self.reopen()
+        db.enroll([0., 1.])
+        db.forget(person_id='p-8')
+        restored = self.reopen()
+        self.assertNotIn('p-8', restored._embeddings)
+        self.assertEqual(restored.forget(named='unknown')['forgotten'], 1)
+        self.assertEqual(self.reopen().list_persons()['total'], 0)
+        self.assertEqual(self.adapter.detect_and_embed.call_count, 1)
+        self.assertEqual(self.reopen().enroll([1., 0.])['person_id'], 'p-10')
+
+    def test_model_mismatch_and_corruption_fail_without_reimport(self):
+        self.legacy_image()
+        self.reopen()
+        original = self.state.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'model mismatch'):
+            self.reopen(model='other-model')
+        self.assertEqual(self.state.read_bytes(), original)
+        valid = json.loads(original)
+        for field, value in [('version', 99), ('embeddings', {'p-8': [[0., 0.]]}),
+                             ('persons', {}), ('next_person_id', 8)]:
+            with self.subTest(field=field):
+                self.state.write_text(json.dumps({**valid, field: value}))
+                damaged = self.state.read_bytes()
+                with self.assertRaises(ValueError):
+                    self.reopen()
+                self.assertEqual(self.state.read_bytes(), damaged)
+        self.state.write_text('{broken')
+        with self.assertRaises(ValueError):
+            self.reopen()
+        self.assertEqual(self.state.read_text(), '{broken')
+        self.assertEqual(self.adapter.detect_and_embed.call_count, 1)
+
+    def test_failed_atomic_save_rolls_back_and_cleans_temporary_files(self):
+        from unittest.mock import patch
+
+        db = self.reopen()
+        pid = db.enroll([1., 0.], name='Original')['person_id']
+        original = self.state.read_bytes()
+        operations = [lambda: db.enroll([0., 1.]),
+                      lambda: db.update_person(pid, name='Changed'),
+                      lambda: db.forget(person_id=pid)]
+        for operation in operations:
+            with patch('os.replace', side_effect=OSError('disk failure')):
+                with self.assertRaises(OSError):
+                    operation()
+            self.assertEqual(self.state.read_bytes(), original)
+            self.assertEqual(db.list_persons(), self.reopen().list_persons())
+            self.assertEqual(list(self.state.parent.glob('*.tmp')), [])
+        self.assertEqual(db.enroll([0., 1.])['person_id'], 'p-2')
+
+    def test_concurrent_persistent_enrollment(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        db = self.reopen()
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(lambda _: db.enroll([1., 0.]), range(16)))
+        self.assertTrue(all(r['ok'] for r in results))
+        self.assertEqual(self.reopen().get_person('p-1')['samples'], 16)
+
+    def test_plugin_port_isolation_restore_and_weight_mismatch(self):
+        from unittest.mock import patch
+
+        self.legacy_image()
+        weights = self.root / 'test-model.onnx'
+        weights.write_bytes(b'test weights')
+        def plugin(port):
+            obj = self.ns['FaceRecognitionPlugin'].__new__(self.ns['FaceRecognitionPlugin'])
+            obj._face_db = self.ns['FaceDatabase']()
+            obj._model_lock = threading.Lock()
+            obj._model = None
+            obj._model_name, obj._model_dir = 'test-model', str(self.root)
+            obj._device, obj._confidence, obj._detector = 'cpu', .5, 'scrfd'
+            obj._face_db_dir = str(self.root)
+            with patch.dict(self.ns, EdgeFaceAdapter=lambda *a, **kw: self.adapter):
+                with patch.dict('os.environ', {'MCP_PORT': port}):
+                    obj._ensure_model()
+            return obj
+        first = plugin('15720')
+        first._face_db.forget(person_id='p-8')
+        self.assertEqual(plugin('15720')._face_db.list_persons()['total'], 0)
+        second = plugin('15820')
+        self.assertEqual(second._face_db.list_persons()['total'], 1)
+        second._face_db.update_person('p-8', name='Second instance')
+        self.assertEqual(plugin('15720')._face_db.list_persons()['total'], 0)
+        self.assertEqual(plugin('15820')._face_db.get_person('p-8')['name'], 'Second instance')
+        self.assertEqual(plugin('')._face_db._state_path,
+                         self.root / '.state' / 'default' / 'state.json')
+        with self.assertRaisesRegex(ValueError, 'MCP_PORT'):
+            plugin('../escape')
+        external = self.root / 'test-model.onnx.data'
+        external.write_bytes(b'external weights')
+        with self.assertRaisesRegex(ValueError, 'model mismatch'):
+            plugin('15720')
+        plugin('15920')
+        external.write_bytes(b'changed external weights')
+        with self.assertRaisesRegex(ValueError, 'model mismatch'):
+            plugin('15920')
+        external.unlink()
+        weights.write_bytes(b'changed weights under same model name')
+        with self.assertRaisesRegex(ValueError, 'model mismatch'):
+            plugin('15720')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -279,6 +279,117 @@ class FaceDatabase:
         self._next_person_id = 1
         self._open_visits: dict[str, dict] = {}
         self._closed_visits: list[dict] = []
+        self._state_path = None
+        self._model_id = None
+        self._committed_state = None
+
+    def initialize_persistence(self, state_path, model_id, db_dir, adapter):
+        """Restore an authoritative snapshot, or import the legacy gallery once.
+
+        The caller must give each writer its own state path. Visit history stays
+        ephemeral. Invalid snapshots fail startup without touching the file.
+        """
+        import json
+
+        with self._lock:
+            path = Path(state_path)
+            self._model_id = model_id
+            try:
+                with path.open(encoding="utf-8") as source:
+                    state = json.load(source)
+            except FileNotFoundError:
+                self.load_from_dir(db_dir, adapter)
+                self._state_path = path
+                self._save_locked()
+            else:
+                self._restore_state_locked(state)
+                self._state_path = path
+                self._committed_state = state
+                self.load_diag = f"restored {len(self._embeddings)} persons from state"
+
+    def _restore_state_locked(self, state):
+        """Validate the entire snapshot before publishing any restored data."""
+        import json
+
+        # Python's decoder accepts NaN/Infinity; persisted state must be strict JSON.
+        json.dumps(state, allow_nan=False)
+        if not isinstance(state, dict) or type(state.get("version")) is not int or state["version"] != 1:
+            raise ValueError("invalid face state version")
+        if state.get("model_id") != self._model_id:
+            raise ValueError("face state model mismatch; use the original model or a separate face_db_dir")
+        embeddings, persons = state.get("embeddings"), state.get("persons")
+        next_id = state.get("next_person_id")
+        if (not isinstance(embeddings, dict) or not isinstance(persons, dict)
+                or set(embeddings) != set(persons)
+                or type(next_id) is not int or next_id < 1):
+            raise ValueError("invalid face state gallery/metadata/ID counter")
+        restored, dimension = {}, None
+        for pid, samples in embeddings.items():
+            if not isinstance(pid, str) or not pid or not isinstance(samples, list) or not samples:
+                raise ValueError("invalid face state identity/samples")
+            vectors = []
+            for sample in samples:
+                vector = np.asarray(sample, dtype=np.float32)
+                if (vector.ndim != 1 or not vector.size or not np.isfinite(vector).all()
+                        or np.linalg.norm(vector) == 0
+                        or (dimension is not None and vector.size != dimension)):
+                    raise ValueError("invalid face state embedding")
+                dimension = vector.size
+                vectors.append(vector)
+            record = persons[pid]
+            if (not isinstance(record, dict) or record.get("id") != pid
+                    or not isinstance(record.get("name"), str)
+                    or not isinstance(record.get("profile"), dict)
+                    or type(record.get("named")) is not bool
+                    or record["named"] != bool(record["name"].strip())
+                    or type(record.get("samples")) is not int
+                    or record["samples"] != len(vectors)):
+                raise ValueError("invalid face state person metadata")
+            if pid.startswith("p-") and pid[2:].isdigit() and next_id <= int(pid[2:]):
+                raise ValueError("invalid face state ID high-water mark")
+            restored[pid] = vectors
+        from copy import deepcopy
+        self._embeddings = restored
+        self._persons = deepcopy(persons)
+        self._next_person_id = next_id
+
+    def _save_locked(self):
+        """Commit under the database lock; failed writes roll back live changes."""
+        import json
+        import tempfile
+
+        if self._state_path is None:
+            return
+        temporary = None
+        try:
+            self._reserve_ids_locked()
+            state = {
+                "version": 1, "model_id": self._model_id,
+                "embeddings": {pid: [v.tolist() for v in samples]
+                               for pid, samples in self._embeddings.items()},
+                "persons": {pid: self._record_locked(pid) for pid in self._embeddings},
+                "next_person_id": self._next_person_id,
+            }
+            payload = json.dumps(state, ensure_ascii=False, allow_nan=False)
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                             dir=self._state_path.parent,
+                                             prefix=".state-", suffix=".tmp",
+                                             delete=False) as target:
+                temporary = target.name
+                os.fchmod(target.fileno(), 0o600)
+                target.write(payload)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temporary, self._state_path)
+            self._committed_state = state
+        except Exception:
+            if self._committed_state is not None:
+                self._restore_state_locked(self._committed_state)
+            raise
+        finally:
+            if temporary is not None and os.path.exists(temporary):
+                os.unlink(temporary)
 
     @staticmethod
     def _clean_profile(profile):
@@ -356,6 +467,7 @@ class FaceDatabase:
                 }
             self._embeddings.setdefault(pid, []).append(sample)
             record = self._record_locked(pid)
+            self._save_locked()
             return {
                 "ok": True, "person_id": pid, "name": record["name"],
                 "profile": record["profile"], "samples": record["samples"],
@@ -380,6 +492,7 @@ class FaceDatabase:
             for key in (profile_delete or []):
                 record["profile"].pop(str(key), None)
             self._persons[pid] = record
+            self._save_locked()
             return self._record_locked(pid)
 
     def list_persons(self, named='all', query='', limit=100, offset=0):
@@ -428,6 +541,7 @@ class FaceDatabase:
                     forgotten.append(pid)
                 else:
                     missing.append(pid)
+            self._save_locked()
             if unknown_scope:
                 return {"ok": True, "forgotten": len(forgotten), "scope": "unknown"}
             result = {"ok": bool(forgotten) or not missing,
@@ -453,7 +567,7 @@ class FaceDatabase:
             n_dirs = n_images = n_fail = 0
 
             for person_dir in sorted(db_path.iterdir()):
-                if not person_dir.is_dir():
+                if person_dir.name == ".state" or not person_dir.is_dir():
                     continue
                 n_dirs += 1
                 person_id = person_dir.name
@@ -1284,8 +1398,25 @@ class FaceRecognitionPlugin:
                 confidence=self._confidence, detector=self._detector,
             )
 
-            # Load identity library
-            self._face_db.load_from_dir(self._face_db_dir, model)
+            # Bind snapshots to both the recognizer name and actual weights.
+            import hashlib
+            fingerprints = []
+            for suffix in (".onnx", ".onnx.data"):
+                weight_path = Path(self._model_dir) / f"{self._model_name}{suffix}"
+                if suffix == ".onnx.data" and not weight_path.exists():
+                    continue
+                digest = hashlib.sha256()
+                with weight_path.open("rb") as weights:
+                    for chunk in iter(lambda: weights.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                fingerprints.append(f"{suffix}:sha256:{digest.hexdigest()}")
+            model_id = f"{self._model_name}:" + ":".join(fingerprints)
+            port = os.environ.get("MCP_PORT", "").strip()
+            if port and (not port.isascii() or not port.isdigit() or not 1 <= int(port) <= 65535):
+                raise ValueError("MCP_PORT must be a valid port for face state isolation")
+            instance = f"mcp-{int(port)}" if port else "default"
+            state_path = Path(self._face_db_dir) / ".state" / instance / "state.json"
+            self._face_db.initialize_persistence(state_path, model_id, self._face_db_dir, model)
             self._model = model
 
     def _start_node(self, node_key: str, input_topic: str):
