@@ -88,9 +88,8 @@ plugins:
     provider: local
     url: ""
     key: ""
-    model: edgeface_s_gamma_05   # 3.65M params — eval-proven best (0.9165; base scored 0.9046);
-                                 # embedded via ONNX Runtime (edgeface_s_gamma_05.onnx, cos=1.0 vs
-                                 # torch, ~8ms vs ~19ms per crop)
+    model: edgeface_base.int8   # Single-file Linear INT8; with SCRFD-2.5G: 25,646,022 bytes
+                                 # Recognition accuracy to be measured by platform evaluation
     detector: scrfd_2.5g         # platform-proven best: f16dec6 (scrfd_2.5g) scored 0.9129
                                  # = iou_accuracy 0.99 x face_accuracy 0.92 — detection was
                                  # never the bottleneck (IoU ~1.0), so keep the more accurate

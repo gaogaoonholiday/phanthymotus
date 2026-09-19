@@ -51,7 +51,7 @@ _MODEL_BASE_URL = os.environ.get(
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DEFAULT_SIMILARITY_THRESHOLD = 0.5  # cosine similarity above this = same person
-DEFAULT_MODEL_NAME = "edgeface_s_gamma_05"  # 3.65M params, ~14MB checkpoint (eval-proven: 0.9165)
+DEFAULT_MODEL_NAME = "edgeface_base.int8"  # Linear INT8; 25,646,022 bytes including SCRFD-2.5G
 
 # Stream enrolment window (register_by_stream / recognize_by_stream): each node
 # keeps the last few seconds of frames, bounded by age and count, so a stream
@@ -232,8 +232,11 @@ def _ensure_weights(model_name: str, model_dir: str, detector: str = "yunet") ->
     """Download model weights from juicefs if not present. Returns ONNX model path."""
     os.makedirs(model_dir, exist_ok=True)
 
-    # Recognizer ONNX (+ external data file, if any)
-    for filename in (f"{model_name}.onnx", f"{model_name}.onnx.data"):
+    # The Base INT8 artifact is self-contained; the legacy S export uses external data.
+    filenames = [f"{model_name}.onnx"]
+    if model_name != "edgeface_base.int8":
+        filenames.append(f"{model_name}.onnx.data")
+    for filename in filenames:
         path = os.path.join(model_dir, filename)
         if os.path.exists(path):
             continue
