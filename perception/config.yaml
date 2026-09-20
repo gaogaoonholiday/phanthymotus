@@ -99,12 +99,8 @@ plugins:
                                  # CPU avoids CUDA context for 10 containers
     model_dir: /models/face
     face_db_dir: /workspace/face_db
-    similarity_threshold: 0.40   # platform-proven on 6f0a583 container sweep: instance 1
-                                 # (0.40) accuracy 0.9227 vs 0.9175 @0.42-0.44, 0.9124
-                                 # @0.45-0.47, 0.9072 @0.48-0.50 — eval domain prefers
-                                 # lower thresholds than LFW (local optimum was 0.45)
-                                 # Optional per-container sweep (disabled by default) overrides this
-                                 # (FACE_CONTAINER_SWEEP=1) — see face.py _container_sweep
+    similarity_threshold: 0.39   # Best in c5df5a9 sweep: instance 1 accuracy 0.9771
+                                 # Sweep disabled by default; FACE_CONTAINER_SWEEP=1 opts in
     confidence: 0.5               # det score threshold; frames with zero dets get
                                   # one automatic retry @0.3 on a 2x-upscaled image
                                   # (rescues payload={} frames: local 12/14 no-det

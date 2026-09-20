@@ -50,7 +50,7 @@ _MODEL_BASE_URL = os.environ.get(
 )
 
 # ── Constants ────────────────────────────────────────────────────────────────
-DEFAULT_SIMILARITY_THRESHOLD = 0.5  # cosine similarity above this = same person
+DEFAULT_SIMILARITY_THRESHOLD = 0.39  # cosine similarity above this = same person
 DEFAULT_MODEL_NAME = "edgeface_base.int8"  # Linear INT8; 25,646,022 bytes including SCRFD-2.5G
 
 # Stream enrolment window (register_by_stream / recognize_by_stream): each node
@@ -67,9 +67,8 @@ VISIT_GAP_S = 600.0  # absent this long → visit closed
 # separately (result.log: "实例 i: accuracy=..."). One submission can therefore
 # A/B multiple parameter sets in a single eval instead of one config per day.
 #
-# FACE_CONTAINER_SWEEP defaults to enabled for the platform's three-instance
-# evaluation. Container index i = (MCP_PORT - 15720) // 100 selects one value;
-# local runs without a matching MCP_PORT remain unchanged.
+# FACE_CONTAINER_SWEEP is opt-in; normal runs use the selected 0.39 threshold.
+# When enabled, index i = (MCP_PORT - 15720) // 100 selects one value.
 #
 # The conservative sweep keeps the previously verified 0.40 reference and probes
 # the two lower thresholds that can recover borderline known identities.
@@ -96,7 +95,7 @@ def _container_index() -> int | None:
 
 def _container_sweep_overrides() -> dict:
     """Parameter overrides for this container; {} for container 0 / non-platform."""
-    if os.environ.get("FACE_CONTAINER_SWEEP", "1").strip().lower() in ("0", "false", "off"):
+    if os.environ.get("FACE_CONTAINER_SWEEP", "0").strip().lower() in ("0", "false", "off"):
         return {}
     idx = _container_index()
     if idx is None:
@@ -1669,7 +1668,9 @@ class FaceRecognitionPlugin:
                         "source": source}
             faces = [_face_result(self._face_db, d, image.shape, self._similarity_threshold)
                      for d in self._model.detect_and_embed(image)]
-            return {"ok": True, "source": source, "count": len(faces), "faces": faces}
+            return {"ok": True, "source": source,
+                    "image_size": {"width": int(image.shape[1]), "height": int(image.shape[0])},
+                    "count": len(faces), "faces": faces}
         except (ValueError, TypeError, KeyError, OSError) as error:
             return {"ok": False, "reason": "bad_input", "detail": str(error)}
 

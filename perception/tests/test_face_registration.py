@@ -68,6 +68,19 @@ class RegistrationContracts(unittest.TestCase):
             self.assertTrue(deletion['ok'], deletion)
             self.assertEqual(self.db.match(np.array([1., 0.]), .4)[0], 'unknown')
 
+    def test_photo_and_url_bbox_dimensions(self):
+        from unittest.mock import patch
+
+        image = np.full((20, 40, 3), 80, np.uint8)
+        for action, args in [('recognize_by_photo', {'image_path': 'sample.png'}),
+                             ('recognize_by_url', {'url': 'https://example.invalid/face.png'})]:
+            with self.subTest(action=action), patch.dict(self.ns, load_image=lambda *a, **k: image):
+                result = self.call(action, **args)
+                self.assertTrue(result['ok'], result)
+                self.assertEqual(result['image_size'], {'width': 40, 'height': 20})
+                self.assertEqual(result['faces'][0]['bbox'], [0., 0., 8., 8.])
+                self.assertEqual(result['faces'][0]['bbox_relative'], [0., 0., .2, .4])
+
     def test_zip_dispatch(self):
         import zipfile
         with tempfile.TemporaryDirectory() as directory:

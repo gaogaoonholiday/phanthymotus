@@ -80,6 +80,11 @@ class FaceContracts(unittest.TestCase):
         self.assertTrue(all(0.0 <= value <= 1.0
                             for value in result["bbox_relative"]))
 
+    def test_container_sweep_disabled_by_default(self):
+        for port in ('15720', '15820', '15920'):
+            with patch.dict(os.environ, {'MCP_PORT': port}, clear=True):
+                self.assertEqual(self.ns['_container_sweep_overrides'](), {})
+
     def test_container_threshold_sweep(self):
         with patch.dict(os.environ, {"FACE_CONTAINER_SWEEP": "1",
                                      "MCP_PORT": "15720"}):
