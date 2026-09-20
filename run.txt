@@ -730,15 +730,18 @@ curl -s http://localhost:15720 -X POST \
 
 本轮提交: EdgeFace-Base Linear INT8 + SCRFD-2.5G，总模型大小 25,646,022 字节。
 同时包含注册身份库原子持久化、重启恢复及 MCP_PORT 实例隔离。
-保持三实例阈值 0.40/0.39/0.38 与归一化 bbox；真实识别收益等待本轮评测。
+默认阈值统一为 0.39，默认关闭三实例扫描（FACE_CONTAINER_SWEEP=1 可显式开启）。
+上一轮 c5df5a9 汇总 F1=0.972222，0.39 对应实例 accuracy=0.9771，为扫描最优。
+本轮补齐照片/URL 识别响应的 image_size；保留像素 xywh bbox 和归一化 xywh bbox_relative。
+平均 IoU=0 的直接原因尚未确认；上游插件只在 NMS 内计算 IoU，不负责榜单平均 IoU。
 识别器下载: http://172.28.4.81:34567/face/edgeface_base.int8.onnx
 SHA256: 8a97eddb4dbba95511f4160c88957d69a75edaa288d8d93afbbaad9a7b6e997a
-31 项人脸测试通过，模型下载地址与本地文件校验和一致。
+33 项人脸测试通过；模型文件未变，此前下载地址与本地文件校验和一致。
 提交信息如下:
 
 env:
   - name: PHANTHYMOTUS_COMMIT_ID
-    value: "c5df5a91b42bc6473a3515fa3800484a788f362a"
+    value: "26db84e495b2e31b7315bfa99112278db4895f20"
   - name: PHANTHYMOTUS_REPO
     value: "https://github.com/gaogaoonholiday/phanthymotus.git"
   - name: JP_VERSION
