@@ -786,7 +786,7 @@ env:
 
 env:
   - name: PHANTHYMOTUS_COMMIT_ID
-    value: "26db84e495b2e31b7315bfa99112278db4895f20"
+    value: "d5fc5e1dbee931ec4685fd1e240b0dc3e118af2f"
   - name: PHANTHYMOTUS_REPO
     value: "https://github.com/gaogaoonholiday/phanthymotus.git"
   - name: JP_VERSION
@@ -799,8 +799,8 @@ env:
     "6,5"  → JP6 和 JP5 机器都跑 (默认)
     "6"    → 只在 JP6 机器上跑
     "5"    → 只在 JP5 机器上跑
-- 上表 GPU 版的 COMMIT_ID 与 CPU 版当前同为 26db84e (该 commit 内 device 仍是 cpu)。
-  推送 GPU 改动后请把 GPU 版的 value 换成新的 commit hash 再提交；CPU 版保持不变。
+- CPU 版对应 26db84e (config face.device: cpu)；GPU 版对应 d5fc5e1
+  (config face.device: gpu，唯一差异)。两版均已推送，可按需切换提交。
 
 提交后榜单会自动:
 1. 拉取你的 fork 仓库代码
