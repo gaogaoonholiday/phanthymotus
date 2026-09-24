@@ -716,9 +716,11 @@ curl -s http://localhost:15720 -X POST \
 
 ┌─ 问题: GPU 占用过高 ───────────────────────────────────────────────┐
 │ 要求: GPU < 10%                                                     │
-│ 当前配置 device: cpu，推理不占 GPU；如误开 cuda:                     │
-│   - 单进程 MTCNN/EdgeFace CUDA 上下文约 300MB，10 容器会 OOM        │
-│   - 评测曾出现 exit 137 (OOM killed)                                 │
+│ 现状: 自本轮起 config 默认 device: gpu (见 §10 GPU 版)，两个 face    │
+│   session 走 CUDA，其余插件 (asr/tts/vop/ocr) 仍为 cpu，不占 GPU。   │
+│   - 单进程 CUDA 上下文约 300MB；3 容器约 0.9GB，可接受              │
+│   - 10 容器约 3.3GB，超出预算曾 OOM (exit 137)；评测若回到 10 容器   │
+│     请把 config 的 device 改回 cpu (改回后无需改 Dockerfile)        │
 │ 排查: 1) 确认 fps 设置合理 (默认 3fps)                              │
 │       2) 用 jtop/tegrastats 监控:                                   │
 │          sudo tegrastats --interval 1000 | grep GR3D                │
@@ -727,6 +729,16 @@ curl -s http://localhost:15720 -X POST \
 ================================================================================
 10. 榜单提交
 ================================================================================
+
+本轮起提交分 CPU / GPU 两版，两版共存于同一份 run.txt（互不覆盖）。
+两版代码差异只有 perception/config.yaml 的 face.device 一行：
+  CPU 版 device: cpu → ORT providers = [CPUExecutionProvider]
+  GPU 版 device: gpu → ORT providers = [CUDAExecutionProvider, CPUExecutionProvider]
+Dockerfile 只有一份，镜像内同时具备两条路径（见下方 GPU 版说明）。
+
+--------------------------------------------------------------------------------
+10.A CPU 版 (上一轮已提交, 保持不变)
+--------------------------------------------------------------------------------
 
 本轮提交: EdgeFace-Base Linear INT8 + SCRFD-2.5G，总模型大小 25,646,022 字节。
 同时包含注册身份库原子持久化、重启恢复及 MCP_PORT 实例隔离。
@@ -747,6 +759,39 @@ env:
   - name: JP_VERSION
     value: "6,5"
 
+--------------------------------------------------------------------------------
+10.B GPU 版 (本轮新增, 与上面 CPU 版共存)
+--------------------------------------------------------------------------------
+
+改动: perception/config.yaml 的 face.device 由 cpu 改为 gpu。模型、阈值、fps、
+输出契约与 CPU 版完全一致，只换 ONNX Runtime 的执行后端，因此两版可对比同一
+指标下的 GPU 收益。
+- providers: gpu → [CUDAExecutionProvider, CPUExecutionProvider]，cpu 仍排在最后
+  一位；宿主机或镜像没有 CUDA 时 ORT 只告警并顺延到 CPU，不会在创建 session
+  时抛异常，所以 device: gpu 不会导致启动失败 (见 plugins/face.py 的
+  _DEVICE_PROVIDERS / _providers_for_device)。
+- 镜像差异: jp6.1 装 onnxruntime-gpu 1.24.0 (来自 pypi.jetson-ai-lab.io/jp6/cu126/，
+  cp310 aarch64，soname 依赖 libcudnn.so.9 / libcudart.so.12，与 jp6.1 base 的
+  CUDA 12.6 + cuDNN 9.4 匹配)；jp5.11 没有 cp38 aarch64 GPU wheel，仍装
+  onnxruntime 1.18.1 CPU 版，因此在 JP5 机器上 device: gpu 自动退化为 CPU。
+  该 GPU wheel 是超集 (同时含 CPUExecutionProvider)，所以 device: cpu 在 jp6.1
+  镜像上依然可用 —— 这是 CPU/GPU 共存的前提。
+- 已知限制: ORT 1.24.0 的 CUDA EP 有 MatMulInteger 但没有 DynamicQuantizeLinear，
+  INT8 识别器 (edgeface_base.int8) 的图会在 CUDA/CPU 之间分区，GPU 对 FP32 的
+  SCRFD-2.5G 检测器收益大于对 INT8 识别器的收益。
+- GPU 显存: 每个进程 CUDA 上下文约 300MB。3 容器约 0.9GB，可接受；10 容器约
+  3.3GB 曾 OOM (exit 137)。若评测回到 10 容器，把 config 的 device 改回 cpu 即可
+  (只改一行，无需重建 Dockerfile 逻辑)。
+提交信息如下:
+
+env:
+  - name: PHANTHYMOTUS_COMMIT_ID
+    value: "26db84e495b2e31b7315bfa99112278db4895f20"
+  - name: PHANTHYMOTUS_REPO
+    value: "https://github.com/gaogaoonholiday/phanthymotus.git"
+  - name: JP_VERSION
+    value: "6,5"
+
 说明:
 - PHANTHYMOTUS_COMMIT_ID: 你 fork 仓库上推送的 commit hash
 - PHANTHYMOTUS_REPO: 你个人 fork 仓库的 HTTPS clone 地址
@@ -754,6 +799,8 @@ env:
     "6,5"  → JP6 和 JP5 机器都跑 (默认)
     "6"    → 只在 JP6 机器上跑
     "5"    → 只在 JP5 机器上跑
+- 上表 GPU 版的 COMMIT_ID 与 CPU 版当前同为 26db84e (该 commit 内 device 仍是 cpu)。
+  推送 GPU 改动后请把 GPU 版的 value 换成新的 commit hash 再提交；CPU 版保持不变。
 
 提交后榜单会自动:
 1. 拉取你的 fork 仓库代码

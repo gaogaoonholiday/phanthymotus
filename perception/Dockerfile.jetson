@@ -45,14 +45,34 @@ ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT
 # image was built for, which is otherwise guesswork from the tag alone.
 ARG SHERPA_GPU_WHEEL_511=jp511/sherpa_onnx-1.13.6+cuda-cp38-cp38-linux_aarch64.whl
 ARG SHERPA_GPU_WHEEL_61=jp61/sherpa_onnx-1.13.6+cuda-cp310-cp310-linux_aarch64.whl
+
+# ORT_GPU_VERSION selects onnxruntime-gpu for the face sessions (see the face
+# deps step). Same per-line wheel problem as sherpa-onnx, but here the source is
+# jetson-ai-lab's index rather than a COS key, because the wheel is upstream's
+# own aarch64 CUDA build and we can pin it by version + index instead of
+# re-hosting it. Empty means "no GPU wheel for this line" — the face step then
+# installs the PyPI CPU wheel, exactly as before.
+#
+#   jp5.11 (focal, cp38)  — none. PyPI aarch64 onnxruntime-gpu starts at cp311
+#                           (1.29.0) and jetson-ai-lab has nothing under jp5, so
+#                           there is no cp38 wheel to install. Stays CPU.
+#   jp6.1  (jammy, cp310) — 1.24.0, the last of that line. cuDNN 9 / CUDA 12.x
+#                           sonames, which is what the jp6.1 base carries.
+ARG ORT_GPU_VERSION_511=
+ARG ORT_GPU_VERSION_61=1.24.0
+ARG ORT_GPU_INDEX_511=
+ARG ORT_GPU_INDEX_61=https://pypi.jetson-ai-lab.io/jp6/cu126/
 RUN case "${JP_VERSION}" in \
-        511) NUMPY=1.24.4; WHEEL="${SHERPA_GPU_WHEEL_511}" ;; \
-        61)  NUMPY=1.26.4; WHEEL="${SHERPA_GPU_WHEEL_61}"  ;; \
-        *)   NUMPY=1.24.4; WHEEL= ;; \
+        511) NUMPY=1.24.4; WHEEL="${SHERPA_GPU_WHEEL_511}"; \
+             ORT="${ORT_GPU_VERSION_511}"; ORT_INDEX="${ORT_GPU_INDEX_511}" ;; \
+        61)  NUMPY=1.26.4; WHEEL="${SHERPA_GPU_WHEEL_61}"; \
+             ORT="${ORT_GPU_VERSION_61}"; ORT_INDEX="${ORT_GPU_INDEX_61}" ;; \
+        *)   NUMPY=1.24.4; WHEEL=; ORT=; ORT_INDEX= ;; \
     esac; \
-    printf 'NUMPY_VERSION=%s\nSHERPA_GPU_WHEEL=%s\nPY_ABI=%s\n' \
+    printf 'NUMPY_VERSION=%s\nSHERPA_GPU_WHEEL=%s\nPY_ABI=%s\nORT_GPU_VERSION=%s\nORT_GPU_INDEX=%s\n' \
         "${NUMPY}" "${WHEEL}" \
         "$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')" \
+        "${ORT}" "${ORT_INDEX}" \
         > /etc/jetpack.env && \
     echo "[build] jp${JP_VERSION}:" && cat /etc/jetpack.env
 
@@ -169,14 +189,43 @@ RUN mkdir -p /work/weights/clip && \
 # EdgeFace backbone (edgenext_small) is created via timm.create_model(); torch,
 # torchvision, Pillow and cv2 are already in the base image / VOP layer. timm is
 # installed --no-deps so it does not pull a different torch/torchvision wheel.
-# onnxruntime is the CPU wheel (not the GPU wheel bundled inside sherpa-onnx):
-# the SCRFD detector runs on CPU to avoid a per-container CUDA context (10
-# containers on a ~1.6GB GPU budget OOM'd before). 1.18.1 is the last line that
-# ships cp38 (jp5.11) and cp310 (jp6.1) aarch64 wheels, matching the sherpa-onnx
-# pin and the two JetPack Python ABIs.
-RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} timm && \
+#
+# onnxruntime is what both face sessions (SCRFD detector + EdgeFace recognizer)
+# run on. Which wheel depends on the JetPack line, and is driven by the config
+# `device` value rather than hardcoded:
+#
+#   jp6.1  onnxruntime-gpu 1.24.0 from jetson-ai-lab (cp310, cuDNN 9 / CUDA 12)
+#          so `device: gpu` can actually reach CUDAExecutionProvider.
+#   jp5.11 onnxruntime==1.18.1 from PyPI (the last line with a cp38 aarch64
+#          wheel). No cp38 onnxruntime-gpu exists anywhere reachable, so a
+#          jp5.11 image falls back to CPU and `device: gpu` degrades to CPU —
+#          ONNX Runtime warns about the missing provider and keeps running.
+#
+# A GPU wheel is a superset: it also contains the CPU provider, so `device: cpu`
+# still works on jp6.1. That is what makes the two settings coexist in one image
+# and one commit.
+#
+# Memory is the reason GPU is opt-in per config, not the default: each process
+# that touches CUDA holds a ~300MB context, and 10 containers on a ~1.6GB budget
+# OOM'd (exit 137) where 3 fit.
+RUN . /etc/jetpack.env; \
+    pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} timm && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} "safetensors>=0.3.1" "huggingface-hub>=0.16.0" && \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} "onnxruntime==1.18.1"
+    if [ -n "${ORT_GPU_VERSION}" ]; then \
+        echo "[build] onnxruntime-gpu ${ORT_GPU_VERSION} for jp${JP_VERSION}" && \
+        pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+            --extra-index-url "${ORT_GPU_INDEX}" \
+            "onnxruntime-gpu==${ORT_GPU_VERSION}" && \
+        python3 -c "import onnxruntime as ort; \
+assert 'CUDAExecutionProvider' in ort.get_available_providers(), \
+    'CUDAExecutionProvider missing from onnxruntime-gpu ' + ort.__version__ + ': ' + str(ort.get_available_providers()); \
+print('[build] onnxruntime', ort.__version__, ort.get_available_providers())"; \
+    else \
+        echo "[build] no onnxruntime-gpu for jp${JP_VERSION} — CPU wheel from PyPI" && \
+        pip3 install --no-cache-dir -i ${PYPI_MIRROR} "onnxruntime==1.18.1" && \
+        python3 -c "import onnxruntime as ort; \
+print('[build] onnxruntime', ort.__version__, ort.get_available_providers())"; \
+    fi
 
 # Set YOLO_CONFIG_DIR so WEIGHTS_DIR resolves to /work/weights
 ENV YOLO_CONFIG_DIR=/work

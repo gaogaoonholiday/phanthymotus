@@ -103,6 +103,29 @@ def _container_sweep_overrides() -> dict:
     thr = _CONTAINER_SWEEP_THRESHOLDS[idx % len(_CONTAINER_SWEEP_THRESHOLDS)]
     return {} if thr is None else {"similarity_threshold": thr}
 
+# ── ONNX Runtime execution providers ─────────────────────────────────────────
+# Both face sessions (SCRFD detector + EdgeFace recognizer) read their provider
+# list from the config `device` value. CPU is the default; `device: gpu` moves
+# them to CUDA and keeps CPU as the second entry, so a host without CUDA — or an
+# image without the GPU wheel — still starts instead of failing at session
+# creation. ONNX Runtime only warns when a listed provider is unavailable and
+# drops to the next one.
+#
+# GPU is opt-in because of the memory, not the speed: every process that creates
+# a CUDA context holds ~300MB of GPU memory. Ten containers on a ~1.6GB budget
+# OOM'd (exit 137); three containers fit.
+_DEVICE_PROVIDERS = {
+    "cpu": ("CPUExecutionProvider",),
+    "gpu": ("CUDAExecutionProvider", "CPUExecutionProvider"),
+    "cuda": ("CUDAExecutionProvider", "CPUExecutionProvider"),
+}
+
+
+def _providers_for_device(device: str) -> list[str]:
+    """Providers for a config `device` value; CPU for anything unrecognised."""
+    return list(_DEVICE_PROVIDERS.get(str(device).strip().lower(), _DEVICE_PROVIDERS["cpu"]))
+
+
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -908,14 +931,16 @@ class SCRFDDetector:
     internally), returns original-coord detections."""
 
     def __init__(self, model_dir: str, confidence: float,
-                 filename: str = "scrfd_500m_kps.onnx"):
+                 filename: str = "scrfd_500m_kps.onnx", device: str = "cpu"):
         import onnxruntime as ort
         so = ort.SessionOptions()
         so.intra_op_num_threads = 4
         model_path = os.path.join(model_dir, filename)
+        providers = _providers_for_device(device)
         self._sess = ort.InferenceSession(
-            model_path, sess_options=so, providers=["CPUExecutionProvider"]
+            model_path, sess_options=so, providers=providers
         )
+        log.info(f"[face] SCRFD session on {self._sess.get_providers()}")
         self._input_name = self._sess.get_inputs()[0].name
         self._confidence = confidence
         self._cache = {}
@@ -1038,7 +1063,8 @@ class EdgeFaceAdapter:
     Model weights are auto-downloaded from juicefs.
 
     device='cpu': ~60-70ms/frame end-to-end — no CUDA context, safe for 10 containers
-    device='cuda' is not used (torch loading removed with the ONNX embedder).
+    device='gpu': both sessions on the CUDA provider, with CPU as the fallback
+    entry so a host or image without CUDA still starts (see _DEVICE_PROVIDERS).
     """
 
     def __init__(self, model_name: str, model_dir: str, device: str = "cpu",
@@ -1054,11 +1080,13 @@ class EdgeFaceAdapter:
         so = ort.SessionOptions()
         so.intra_op_num_threads = 2
         so.inter_op_num_threads = 1
+        providers = _providers_for_device(device)
         self._sess = ort.InferenceSession(
-            onnx_path, sess_options=so, providers=["CPUExecutionProvider"]
+            onnx_path, sess_options=so, providers=providers
         )
         self._input_name = self._sess.get_inputs()[0].name
-        log.info(f"[face] EdgeFace loaded (ONNX): {onnx_path}")
+        log.info(f"[face] EdgeFace loaded (ONNX): {onnx_path} "
+                 f"on {self._sess.get_providers()}")
 
         # ── Face detector ──
         self._confidence = confidence
@@ -1070,6 +1098,7 @@ class EdgeFaceAdapter:
                 model_dir, confidence,
                 {"scrfd": "scrfd_500m_kps.onnx",
                  "scrfd_2.5g": "scrfd_2.5g_bnkps_hsuyabc.onnx"}.get(detector),
+                device=device,
             )
             log.info(f"[face] SCRFD ({detector}) loaded, conf={confidence}")
 

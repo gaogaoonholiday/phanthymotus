@@ -436,6 +436,48 @@ Notes:
   live in `resource-center/deploy/values.env` (`COS_SECRET_ID` / `COS_SECRET_KEY`);
   the bucket is `agi-phanthy-dev-1252788780` in `ap-beijing`.
 
+**The face sessions use a different, upstream wheel.** `config.yaml`'s `face.device`
+selects the ONNX Runtime provider list for both face sessions (`gpu` →
+`[CUDAExecutionProvider, CPUExecutionProvider]`, `cpu` → `[CPUExecutionProvider]`),
+so the image needs an `onnxruntime-gpu` alongside the CPU `onnxruntime` the rest of
+the plugins use. Unlike sherpa-onnx this one is not re-hosted on COS: it is NVIDIA's
+own aarch64 CUDA build, published on the jetson-ai-lab index, so `Dockerfile.jetson`
+pins it by version and index instead.
+
+| | onnxruntime-gpu | index | provider list |
+|---|---|---|---|
+| jp5.11 (focal, cp38) | — | — | CPU only (`onnxruntime==1.18.1`) |
+| jp6.1 (jammy, cp310) | 1.24.0 | `https://pypi.jetson-ai-lab.io/jp6/cu126/` | CUDA + CPU |
+
+There is no cp38 aarch64 `onnxruntime-gpu` anywhere — PyPI's aarch64 builds start at
+cp311 (1.29.0) and the jetson-ai-lab `jp5/*` indexes carry none — so jp5.11 keeps the
+PyPI CPU wheel and `device: gpu` degrades to CPU there. On jp6.1 the CUDA provider's
+sonames are `libcudnn.so.9` / `libcudart.so.12` / `libcublas.so.12` /
+`libcublasLt.so.12` / `libcufft.so.11`, which is what the jp6.1 base (CUDA 12.6,
+cuDNN 9.4.0) resolves; 1.18.0 would need cuDNN 8.9.4 and would not load. The
+Dockerfile asserts `CUDAExecutionProvider in ort.get_available_providers()` after
+installing, so a wheel that cannot register the provider fails the build rather than
+silently running CPU.
+
+The GPU wheel is a **superset** — it still lists `CPUExecutionProvider` — which is
+what lets one image serve both `device` values. That coexistence is the point: `cpu`
+remains the last entry in the GPU provider list, so a host or image without CUDA
+(including every jp5.11 build) logs a warning and runs on CPU instead of raising at
+session creation.
+
+**The CUDA EP has no `DynamicQuantizeLinear`.** In 1.24.0 `MatMulInteger` has a CUDA
+kernel but `DynamicQuantizeLinear`, `ConvInteger` and `QLinearMatMul` do not, so the
+INT8 recognizer graph (`edgeface_base.int8`) partitions across the CUDA and CPU EPs
+and the GPU upside lands mostly on the FP32 SCRFD-2.5G detector, not the recognizer.
+Expect the same shape of result as the sherpa-onnx note above: ORT's CUDA provider has
+no int8 kernels, and int8 on CUDA measured 0.4–0.7x there.
+
+Memory, not latency, is the reason `gpu` is a config switch rather than the default:
+each process that creates a CUDA context holds ~300 MB of GPU memory, so three
+containers cost ~0.9 GB while ten cost ~3.3 GB and OOM'd (exit 137). Reverting is a
+one-line `config.yaml` edit — no Dockerfile change, since the GPU wheel runs `cpu`
+just as well.
+
 ---
 
 ## asr_kws and espeak

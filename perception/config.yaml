@@ -94,9 +94,17 @@ plugins:
                                  # = iou_accuracy 0.99 x face_accuracy 0.92 — detection was
                                  # never the bottleneck (IoU ~1.0), so keep the more accurate
                                  # detector; ONNX embed removes the torch cost instead
-    device: cpu                  # scrfd_2.5g ~29ms + ONNX EdgeFace ~8ms → e2e p50 ~43ms local
-                                 # (platform 3.7s is 10-container contention, not the model);
-                                 # CPU avoids CUDA context for 10 containers
+    device: gpu                  # CUDA for both sessions, CPU kept as the fallback
+                                 # provider entry (see _DEVICE_PROVIDERS in plugins/face.py):
+                                 # `gpu` = [CUDA, CPU], `cpu` = [CPU]. An image or host
+                                 # without CUDA logs a warning and stays on CPU, so this
+                                 # value never blocks startup. jp6.1 installs the GPU wheel
+                                 # (onnxruntime-gpu 1.24.0); jp5.11 has no cp38 aarch64
+                                 # GPU wheel and therefore always runs CPU.
+                                 # GPU memory, not latency, is the tradeoff: ~300MB of
+                                 # CUDA context per container, which 3 containers fit and
+                                 # 10 did not (exit 137 OOM). Revert to `cpu` if the
+                                 # evaluator goes back to 10 containers.
     model_dir: /models/face
     face_db_dir: /workspace/face_db
     similarity_threshold: 0.39   # Best in c5df5a9 sweep: instance 1 accuracy 0.9771

@@ -26,6 +26,7 @@ def load_face():
                   "_ARCFACE_REF", "_SCRFD_STRIDES", "_SCRFD_NUM_ANCHORS",
                   "_DETECT_TARGET_W", "_CONTAINER_SWEEP_THRESHOLDS",
                   "_CONTAINER_PORT_BASE", "_CONTAINER_PORT_STRIDE",
+                  "_DEVICE_PROVIDERS",
               } for t in node.targets)]
     ns = dict(np=np, os=os, log=logging.getLogger(__name__), urllib=urllib,
               DEFAULT_MODEL_NAME="edgeface_s_gamma_05", _MODEL_BASE_URL="https://example.invalid")
@@ -98,6 +99,31 @@ class FaceContracts(unittest.TestCase):
                                      "MCP_PORT": "15920"}):
             self.assertEqual(self.ns["_container_sweep_overrides"](),
                              {"similarity_threshold": 0.38})
+
+    def test_device_provider_selection(self):
+        """`device` selects the ORT provider list; CPU stays last so an image or
+        host without CUDA still starts instead of raising at session creation."""
+        providers = self.ns["_providers_for_device"]
+        self.assertEqual(providers("cpu"), ["CPUExecutionProvider"])
+        self.assertEqual(providers("gpu"),
+                         ["CUDAExecutionProvider", "CPUExecutionProvider"])
+        self.assertEqual(providers("CUDA"), providers("gpu"))
+        self.assertEqual(providers(" GPU "), providers("gpu"))
+        # Anything unrecognised (including the config default) stays on CPU.
+        for value in ("", "npu", "tensorrt", None):
+            self.assertEqual(providers(value), ["CPUExecutionProvider"])
+
+    def test_sessions_take_device(self):
+        """Both sessions must accept a device kwarg — the hardcoded CPU provider
+        list was the reason `device: gpu` was a no-op before."""
+        import inspect
+        for cls in ("SCRFDDetector", "EdgeFaceAdapter"):
+            params = inspect.signature(self.ns[cls].__init__).parameters
+            self.assertIn("device", params, cls)
+            self.assertEqual(params["device"].default, "cpu", cls)
+        src = (Path(__file__).resolve().parents[1] / "plugins" / "face.py").read_text()
+        self.assertNotIn('providers=["CPUExecutionProvider"]', src)
+        self.assertEqual(src.count("_providers_for_device(device)"), 2)
 
     def test_forward_reshape_contract(self):
         """2.5G outputs carry a leading batch dim / named outputs; _forward must
