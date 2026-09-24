@@ -439,9 +439,12 @@ Notes:
 **The face sessions use a different, upstream wheel.** `config.yaml`'s `face.device`
 selects the ONNX Runtime provider list for both face sessions (`gpu` →
 `[CUDAExecutionProvider, CPUExecutionProvider]`, `cpu` → `[CPUExecutionProvider]`),
-so the image needs an `onnxruntime-gpu` alongside the CPU `onnxruntime` the rest of
-the plugins use. Unlike sherpa-onnx this one is not re-hosted on COS: it is NVIDIA's
-own aarch64 CUDA build, published on the jetson-ai-lab index, so `Dockerfile.jetson`
+and `face.detector_device` / `face.recognizer_device` override one session each —
+the detector and recognizer want different providers (see the INT8 note below), so
+the deployment runs `detector_device: gpu` + `recognizer_device: cpu`. The image
+needs an `onnxruntime-gpu` alongside the CPU `onnxruntime` the rest of the plugins
+use. Unlike sherpa-onnx this one is not re-hosted on COS: it is NVIDIA's own
+aarch64 CUDA build, published on the jetson-ai-lab index, so `Dockerfile.jetson`
 pins it by version and index instead.
 
 | | onnxruntime-gpu | index | provider list |
@@ -460,23 +463,30 @@ installing, so a wheel that cannot register the provider fails the build rather 
 silently running CPU.
 
 The GPU wheel is a **superset** — it still lists `CPUExecutionProvider` — which is
-what lets one image serve both `device` values. That coexistence is the point: `cpu`
-remains the last entry in the GPU provider list, so a host or image without CUDA
+what lets one image serve every `device` combination. That coexistence is the point:
+`cpu` remains the last entry in the GPU provider list, so a host or image without CUDA
 (including every jp5.11 build) logs a warning and runs on CPU instead of raising at
 session creation.
 
 **The CUDA EP has no `DynamicQuantizeLinear`.** In 1.24.0 `MatMulInteger` has a CUDA
 kernel but `DynamicQuantizeLinear`, `ConvInteger` and `QLinearMatMul` do not, so the
 INT8 recognizer graph (`edgeface_base.int8`) partitions across the CUDA and CPU EPs
-and the GPU upside lands mostly on the FP32 SCRFD-2.5G detector, not the recognizer.
-Expect the same shape of result as the sherpa-onnx note above: ORT's CUDA provider has
-no int8 kernels, and int8 on CUDA measured 0.4–0.7x there.
+and ORT inserts Memcpy nodes to shuffle activations between them (129 of them for this
+graph — `d5fc5e1` eval). Same INT8 arithmetic, so accuracy is unchanged; the cost is
+pure latency. Expect the same shape of result as the sherpa-onnx note above: ORT's
+CUDA provider has no int8 kernels, and int8 on CUDA measured 0.4–0.7x there.
 
-Memory, not latency, is the reason `gpu` is a config switch rather than the default:
-each process that creates a CUDA context holds ~300 MB of GPU memory, so three
-containers cost ~0.9 GB while ten cost ~3.3 GB and OOM'd (exit 137). Reverting is a
-one-line `config.yaml` edit — no Dockerfile change, since the GPU wheel runs `cpu`
-just as well.
+That is why the split exists. The SCRFD-2.5G detector is 157 nodes, all FP32
+(Conv/Relu/MaxPool/Add/Resize/Sigmoid), so it runs wholly on CUDA with no partitioning
+— the GPU speeds up the detector and nothing else. `detector_device: gpu` +
+`recognizer_device: cpu` gets the detector on CUDA while leaving the INT8 recognizer
+whole on one EP. Pinning both to `gpu` pays the Memcpy cost for no accuracy gain.
+
+Memory, not latency, is the reason the GPU is opt-in: each process that creates a CUDA
+context holds ~300 MB of GPU memory, so three containers cost ~0.9 GB while ten cost
+~3.3 GB and OOM'd (exit 137). The context is created by whichever session goes to CUDA
+first, so the split costs the same ~300 MB as running both on GPU. Reverting is a
+`config.yaml` edit — no Dockerfile change, since the GPU wheel runs `cpu` just as well.
 
 ---
 

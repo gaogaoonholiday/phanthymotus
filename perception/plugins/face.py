@@ -105,11 +105,22 @@ def _container_sweep_overrides() -> dict:
 
 # ── ONNX Runtime execution providers ─────────────────────────────────────────
 # Both face sessions (SCRFD detector + EdgeFace recognizer) read their provider
-# list from the config `device` value. CPU is the default; `device: gpu` moves
-# them to CUDA and keeps CPU as the second entry, so a host without CUDA — or an
-# image without the GPU wheel — still starts instead of failing at session
-# creation. ONNX Runtime only warns when a listed provider is unavailable and
-# drops to the next one.
+# list from config `device`, which sets both. `detector_device` /
+# `recognizer_device` override one side, because the two sessions want different
+# providers:
+#
+#   detector   SCRFD-2.5G, 157 nodes all FP32 → every op has a CUDA kernel.
+#   recognizer EdgeFace INT8: 43 DynamicQuantizeLinear + 43 MatMulInteger. ORT
+#              1.24.0 has MatMulInteger on CUDA but *not* DynamicQuantizeLinear,
+#              so the graph partitions across the two EPs and ORT inserts
+#              Memcpy nodes (129 of them) to shuttle activations back and forth.
+#              Same INT8 arithmetic, so accuracy is unchanged — the cost is
+#              pure latency. Keep this session on CPU.
+#
+# CPU is the default. A `gpu` value lists CUDA first and CPU second, so a host
+# without CUDA — or an image without the GPU wheel — still starts instead of
+# failing at session creation; ONNX Runtime only warns when a listed provider is
+# unavailable and drops to the next one.
 #
 # GPU is opt-in because of the memory, not the speed: every process that creates
 # a CUDA context holds ~300MB of GPU memory. Ten containers on a ~1.6GB budget
@@ -236,8 +247,20 @@ TOOLS = [
                 "device": {
                     "type": "string",
                     "enum": ["cuda", "cpu"],
-                    "description": "Inference device",
+                    "description": "Inference device for both sessions",
                     "default": "cpu",
+                    "scope": "shared",
+                },
+                "detector_device": {
+                    "type": "string",
+                    "enum": ["cuda", "cpu"],
+                    "description": "Override `device` for the SCRFD/YuNet detector session",
+                    "scope": "shared",
+                },
+                "recognizer_device": {
+                    "type": "string",
+                    "enum": ["cuda", "cpu"],
+                    "description": "Override `device` for the EdgeFace recognizer session",
                     "scope": "shared",
                 },
             },
@@ -1065,10 +1088,16 @@ class EdgeFaceAdapter:
     device='cpu': ~60-70ms/frame end-to-end — no CUDA context, safe for 10 containers
     device='gpu': both sessions on the CUDA provider, with CPU as the fallback
     entry so a host or image without CUDA still starts (see _DEVICE_PROVIDERS).
+    `device` sets both sessions; `detector_device` / `recognizer_device` override
+    one side. The intended split is detector gpu + recognizer cpu: SCRFD-2.5G is
+    all FP32 and runs wholly on CUDA, while the INT8 recognizer partitions across
+    the EPs because the CUDA EP lacks DynamicQuantizeLinear (see _DEVICE_PROVIDERS).
     """
 
     def __init__(self, model_name: str, model_dir: str, device: str = "cpu",
-                 confidence: float = 0.5, detector: str = "yunet"):
+                 confidence: float = 0.5, detector: str = "yunet",
+                 detector_device: str | None = None,
+                 recognizer_device: str | None = None):
         import onnxruntime as ort
 
         # Download weights from juicefs (returns the recognizer ONNX path)
@@ -1080,7 +1109,7 @@ class EdgeFaceAdapter:
         so = ort.SessionOptions()
         so.intra_op_num_threads = 2
         so.inter_op_num_threads = 1
-        providers = _providers_for_device(device)
+        providers = _providers_for_device(recognizer_device or device)
         self._sess = ort.InferenceSession(
             onnx_path, sess_options=so, providers=providers
         )
@@ -1098,7 +1127,7 @@ class EdgeFaceAdapter:
                 model_dir, confidence,
                 {"scrfd": "scrfd_500m_kps.onnx",
                  "scrfd_2.5g": "scrfd_2.5g_bnkps_hsuyabc.onnx"}.get(detector),
-                device=device,
+                device=detector_device or device,
             )
             log.info(f"[face] SCRFD ({detector}) loaded, conf={confidence}")
 
@@ -1359,6 +1388,9 @@ class FaceRecognitionPlugin:
         self._executor = executor
         self._model_name = plugin_cfg.get("model", DEFAULT_MODEL_NAME)
         self._device = plugin_cfg.get("device", "cpu")
+        # Per-session overrides; None means "follow `device`" (see EdgeFaceAdapter).
+        self._detector_device = plugin_cfg.get("detector_device") or None
+        self._recognizer_device = plugin_cfg.get("recognizer_device") or None
         self._detector = plugin_cfg.get("detector", "scrfd_2.5g")
         self._face_db_dir = plugin_cfg.get("face_db_dir") or os.getenv("FACE_DB_DIR", "/workspace/face_db")
         self._model_dir = plugin_cfg.get("model_dir", "/models/face")
@@ -1384,6 +1416,8 @@ class FaceRecognitionPlugin:
         self._instance_configs: dict[str, dict] = {}
 
         log.info(f"[face] plugin init: model={self._model_name}, device={self._device}, "
+                 f"detector_device={self._detector_device or self._device}, "
+                 f"recognizer_device={self._recognizer_device or self._device}, "
                  f"detector={self._detector}, face_db_dir={self._face_db_dir}")
         if self._sweep_overrides:
             idx = _container_index()
@@ -1427,6 +1461,8 @@ class FaceRecognitionPlugin:
             model = EdgeFaceAdapter(
                 self._model_name, self._model_dir, self._device,
                 confidence=self._confidence, detector=self._detector,
+                detector_device=self._detector_device,
+                recognizer_device=self._recognizer_device,
             )
 
             # Bind snapshots to both the recognizer name and actual weights.
@@ -1827,6 +1863,10 @@ class FaceRecognitionPlugin:
                     self._detector = cfg["detector"]
                 if "device" in cfg:
                     self._device = cfg["device"]
+                if "detector_device" in cfg:
+                    self._detector_device = cfg["detector_device"] or None
+                if "recognizer_device" in cfg:
+                    self._recognizer_device = cfg["recognizer_device"] or None
                 if "face_db_dir" in cfg:
                     self._face_db_dir = cfg["face_db_dir"]
                 if "model_dir" in cfg:

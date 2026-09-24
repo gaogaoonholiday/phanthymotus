@@ -94,17 +94,31 @@ plugins:
                                  # = iou_accuracy 0.99 x face_accuracy 0.92 — detection was
                                  # never the bottleneck (IoU ~1.0), so keep the more accurate
                                  # detector; ONNX embed removes the torch cost instead
-    device: gpu                  # CUDA for both sessions, CPU kept as the fallback
-                                 # provider entry (see _DEVICE_PROVIDERS in plugins/face.py):
-                                 # `gpu` = [CUDA, CPU], `cpu` = [CPU]. An image or host
-                                 # without CUDA logs a warning and stays on CPU, so this
-                                 # value never blocks startup. jp6.1 installs the GPU wheel
+    device: cpu                  # Base provider for both face sessions. CPU kept as
+                                 # the second entry of every GPU list (see
+                                 # _DEVICE_PROVIDERS in plugins/face.py), so `gpu` =
+                                 # [CUDA, CPU], `cpu` = [CPU]. An image or host without
+                                 # CUDA logs a warning and stays on CPU, so no value
+                                 # ever blocks startup. jp6.1 installs the GPU wheel
                                  # (onnxruntime-gpu 1.24.0); jp5.11 has no cp38 aarch64
                                  # GPU wheel and therefore always runs CPU.
                                  # GPU memory, not latency, is the tradeoff: ~300MB of
                                  # CUDA context per container, which 3 containers fit and
-                                 # 10 did not (exit 137 OOM). Revert to `cpu` if the
-                                 # evaluator goes back to 10 containers.
+                                 # 10 did not (exit 137 OOM).
+    detector_device: gpu         # SCRFD-2.5G is 157 nodes, all FP32 (Conv/Relu/MaxPool/
+                                 # Add/Resize/Sigmoid…) — every op has a CUDA kernel, so
+                                 # this session runs wholly on CUDA with no partitioning.
+                                 # This is the only session the GPU actually speeds up.
+    recognizer_device: cpu       # EdgeFace INT8 must stay on CPU. The graph is dynamic
+                                 # quantization of nn.Linear: 43 DynamicQuantizeLinear +
+                                 # 43 MatMulInteger. ORT 1.24.0's CUDA EP has
+                                 # MatMulInteger but no DynamicQuantizeLinear, so on CUDA
+                                 # the graph partitions across the EPs and ORT inserts
+                                 # 129 Memcpy nodes to shuffle activations between them
+                                 # (d5fc5e1 eval, darvin.log:337). Same INT8 arithmetic →
+                                 # same accuracy, extra copies → worse latency.
+                                 # Same reason the ASR plugin keeps int8 on cpu
+                                 # (README "Why int8 loses on the GPU").
     model_dir: /models/face
     face_db_dir: /workspace/face_db
     similarity_threshold: 0.39   # Best in c5df5a9 sweep: instance 1 accuracy 0.9771

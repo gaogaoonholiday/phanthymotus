@@ -123,7 +123,26 @@ class FaceContracts(unittest.TestCase):
             self.assertEqual(params["device"].default, "cpu", cls)
         src = (Path(__file__).resolve().parents[1] / "plugins" / "face.py").read_text()
         self.assertNotIn('providers=["CPUExecutionProvider"]', src)
-        self.assertEqual(src.count("_providers_for_device(device)"), 2)
+        # One provider list per session: the SCRFD detector and the recognizer.
+        self.assertIn("_providers_for_device(device)", src)
+        self.assertIn("_providers_for_device(recognizer_device or device)", src)
+
+    def test_split_device_overrides(self):
+        """The detector and recognizer can be pinned to different providers:
+        SCRFD-2.5G (all FP32) on CUDA, EdgeFace INT8 on CPU — the INT8 graph
+        partitions across EPs because the CUDA EP has no DynamicQuantizeLinear."""
+        import inspect
+        params = inspect.signature(self.ns["EdgeFaceAdapter"].__init__).parameters
+        for name in ("detector_device", "recognizer_device"):
+            self.assertIn(name, params, name)
+            self.assertIsNone(params[name].default, name)
+        src = (Path(__file__).resolve().parents[1] / "plugins" / "face.py").read_text()
+        # Both overrides must fall back to `device` when unset.
+        self.assertIn("_providers_for_device(recognizer_device or device)", src)
+        self.assertIn("device=detector_device or device", src)
+        # And the plugin must forward them from config into the adapter.
+        self.assertIn("detector_device=self._detector_device", src)
+        self.assertIn("recognizer_device=self._recognizer_device", src)
 
     def test_forward_reshape_contract(self):
         """2.5G outputs carry a leading batch dim / named outputs; _forward must

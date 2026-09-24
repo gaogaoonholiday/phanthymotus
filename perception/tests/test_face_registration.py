@@ -240,6 +240,7 @@ class PersistenceContracts(unittest.TestCase):
             obj._model = None
             obj._model_name, obj._model_dir = 'test-model', str(self.root)
             obj._device, obj._confidence, obj._detector = 'cpu', .5, 'scrfd'
+            obj._detector_device = obj._recognizer_device = None
             obj._face_db_dir = str(self.root)
             with patch.dict(self.ns, EdgeFaceAdapter=lambda *a, **kw: self.adapter):
                 with patch.dict('os.environ', {'MCP_PORT': port}):
