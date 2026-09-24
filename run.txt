@@ -716,11 +716,13 @@ curl -s http://localhost:15720 -X POST \
 
 ┌─ 问题: GPU 占用过高 ───────────────────────────────────────────────┐
 │ 要求: GPU < 10%                                                     │
-│ 现状: 自本轮起 config 默认 device: gpu (见 §10 GPU 版)，两个 face    │
-│   session 走 CUDA，其余插件 (asr/tts/vop/ocr) 仍为 cpu，不占 GPU。   │
+│ 现状: 自本轮起 config 为 device: cpu + detector_device: gpu +        │
+│   recognizer_device: cpu (见 §10 拆分版)，只有 FP32 的 SCRFD 检测器  │
+│   走 CUDA，INT8 识别器和其余插件 (asr/tts/vop/ocr) 都在 CPU，不占    │
+│   GPU。                                                             │
 │   - 单进程 CUDA 上下文约 300MB；3 容器约 0.9GB，可接受              │
 │   - 10 容器约 3.3GB，超出预算曾 OOM (exit 137)；评测若回到 10 容器   │
-│     请把 config 的 device 改回 cpu (改回后无需改 Dockerfile)        │
+│     请把 config 的 detector_device 改成 cpu (改回后无需改 Dockerfile)│
 │ 排查: 1) 确认 fps 设置合理 (默认 3fps)                              │
 │       2) 用 jtop/tegrastats 监控:                                   │
 │          sudo tegrastats --interval 1000 | grep GR3D                │
@@ -730,11 +732,14 @@ curl -s http://localhost:15720 -X POST \
 10. 榜单提交
 ================================================================================
 
-本轮起提交分 CPU / GPU 两版，两版共存于同一份 run.txt（互不覆盖）。
-两版代码差异只有 perception/config.yaml 的 face.device 一行：
-  CPU 版 device: cpu → ORT providers = [CPUExecutionProvider]
-  GPU 版 device: gpu → ORT providers = [CUDAExecutionProvider, CPUExecutionProvider]
-Dockerfile 只有一份，镜像内同时具备两条路径（见下方 GPU 版说明）。
+本轮起提交分三版，三版共存于同一份 run.txt（互不覆盖）：
+  10.A CPU 版   device: cpu                                → providers = [CPU]
+  10.B GPU 版   device: gpu                                → [CUDA, CPU] 两个 session
+  10.C 拆分版   device: cpu + detector_device: gpu
+                + recognizer_device: cpu                   → 检测器 CUDA、识别器 CPU
+三版代码差异只在 perception/config.yaml 的 face 设备字段（10.C 另需 plugins/face.py
+的 device 覆盖参数，见该节）。Dockerfile 只有一份，镜像内同时具备两条路径
+（见下方 GPU 版说明）。
 
 --------------------------------------------------------------------------------
 10.A CPU 版 (上一轮已提交, 保持不变)
@@ -792,6 +797,56 @@ env:
   - name: JP_VERSION
     value: "6,5"
 
+--------------------------------------------------------------------------------
+10.C 拆分版 (本轮新增, 检测器 GPU + 识别器 CPU, 与上面两版共存)
+--------------------------------------------------------------------------------
+
+动机: 10.B 把两个 session 一起放上 GPU，但只有 SCRFD 检测器真正受益。拆分后
+检测器走 CUDA、识别器留在 CPU，各取所需，CUDA 上下文仍是同一个 (由检测器创建)，
+显存不增加。
+
+依据 (d5fc5e1 平台评测 darvin.log):
+- SCRFD-2.5G 是 157 节点全 FP32 (Conv/Relu/MaxPool/Add/Resize/Sigmoid)，每个算子
+  都有 CUDA kernel，整图跑在 CUDA 上，不发生分区。
+- EdgeFace-Base INT8 是 nn.Linear 的动态量化: 43 个 DynamicQuantizeLinear + 43 个
+  MatMulInteger。ORT 1.24.0 的 CUDA EP 有 MatMulInteger 但没有 DynamicQuantizeLinear，
+  放上 GPU 后整图在 CUDA/CPU 之间分区，ORT 插入 129 个 Memcpy 节点来回搬激活
+  (darvin.log:337)。INT8 算术不变 → 精度不变，多的只是搬运 → 延迟更差。
+  与 ASR 侧结论一致 (README "Why int8 loses on the GPU": int8 on CUDA 实测 0.4–0.7x)。
+- 精度侧两版无差异: d5fc5e1 实例 0 accuracy=0.9771，与 CPU 基线锚点相同
+  (见 §10.A 的 c5df5a9 记录)；多实例均值 0.9716 vs 0.972222，差 0.0005 ≈ 噪声。
+
+改动 (两处):
+1. perception/config.yaml
+     device: cpu
+     detector_device: gpu        # 新增
+     recognizer_device: cpu      # 新增
+2. perception/plugins/face.py — EdgeFaceAdapter 新增 detector_device / recognizer_device
+   两个可选参数，未设置时回落到 device (所以 10.A/10.B 的行为完全不变):
+     providers = _providers_for_device(recognizer_device or device)   # 识别器 session
+     SCRFDDetector(..., device=detector_device or device)             # 检测器 session
+   插件层从 config 读取并透传，日志新增 detector_device/recognizer_device 两项。
+
+兼容性:
+- 未设置这两个字段时行为与 10.B 完全相同 (回落 device)，因此旧提交不受影响。
+- 与 10.B 一样依赖 jp6.1 的 onnxruntime-gpu 1.24.0 超集 wheel；jp5.11 无 GPU wheel，
+  detector_device: gpu 只告警并顺延到 CPU，不会启动失败。
+- 显存与 10.B 相同 (~300MB/容器，3 容器约 0.9GB)；若评测回到 10 容器，把
+  detector_device 改成 cpu 即可 (仍无需改 Dockerfile)。
+
+36 项人脸测试通过 (新增 test_split_device_overrides 校验两个覆盖参数的回落行为)。
+模型文件未变，与 10.A/10.B 同一份 25,646,022 字节。
+
+提交信息如下:
+
+env:
+  - name: PHANTHYMOTUS_COMMIT_ID
+    value: "740ef935ea2d3373044dc75ce4b08efd397e9e2b"
+  - name: PHANTHYMOTUS_REPO
+    value: "https://github.com/gaogaoonholiday/phanthymotus.git"
+  - name: JP_VERSION
+    value: "6,5"
+
 说明:
 - PHANTHYMOTUS_COMMIT_ID: 你 fork 仓库上推送的 commit hash
 - PHANTHYMOTUS_REPO: 你个人 fork 仓库的 HTTPS clone 地址
@@ -800,7 +855,9 @@ env:
     "6"    → 只在 JP6 机器上跑
     "5"    → 只在 JP5 机器上跑
 - CPU 版对应 26db84e (config face.device: cpu)；GPU 版对应 d5fc5e1
-  (config face.device: gpu，唯一差异)。两版均已推送，可按需切换提交。
+  (config face.device: gpu，唯一差异)；拆分版对应 740ef93 (config 新增
+  detector_device/recognizer_device，未设置时回落到 device)。三版均已推送，
+  可按需切换提交。
 
 提交后榜单会自动:
 1. 拉取你的 fork 仓库代码
