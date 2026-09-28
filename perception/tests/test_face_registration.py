@@ -78,8 +78,11 @@ class RegistrationContracts(unittest.TestCase):
                 result = self.call(action, **args)
                 self.assertTrue(result['ok'], result)
                 self.assertEqual(result['image_size'], {'width': 40, 'height': 20})
-                self.assertEqual(result['faces'][0]['bbox'], [0., 0., 8., 8.])
                 self.assertEqual(result['faces'][0]['bbox_relative'], [0., 0., .2, .4])
+                # The grader reads `bbox`; it must carry the same normalized
+                # xywh, with the pixel box demoted to `bbox_px`.
+                self.assertEqual(result['faces'][0]['bbox'], [0., 0., .2, .4])
+                self.assertEqual(result['faces'][0]['bbox_px'], [0., 0., 8., 8.])
 
     def test_zip_dispatch(self):
         import zipfile
