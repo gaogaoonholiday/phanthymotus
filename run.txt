@@ -732,13 +732,16 @@ curl -s http://localhost:15720 -X POST \
 10. 榜单提交
 ================================================================================
 
-本轮起提交分三版，三版共存于同一份 run.txt（互不覆盖）：
+本轮起提交分四版，四版共存于同一份 run.txt（互不覆盖）：
   10.A CPU 版   device: cpu                                → providers = [CPU]
   10.B GPU 版   device: gpu                                → [CUDA, CPU] 两个 session
   10.C 拆分版   device: cpu + detector_device: gpu
                 + recognizer_device: cpu                   → 检测器 CUDA、识别器 CPU
-三版代码差异只在 perception/config.yaml 的 face 设备字段（10.C 另需 plugins/face.py
-的 device 覆盖参数，见该节）。Dockerfile 只有一份，镜像内同时具备两条路径
+  10.D 坐标修复版 device: cpu + detector_device: gpu
+                + recognizer_device: cpu                   → 同 10.C，另修榜单 bbox 字段
+10.A/10.B/10.C 的代码差异只在 perception/config.yaml 的 face 设备字段（10.C 另需
+plugins/face.py 的 device 覆盖参数）。10.D 在 10.C 基础上再改 plugins/face.py 的
+_face_result 输出字段（见该节）。Dockerfile 只有一份，镜像内同时具备两条路径
 （见下方 GPU 版说明）。
 
 --------------------------------------------------------------------------------
@@ -750,7 +753,8 @@ curl -s http://localhost:15720 -X POST \
 默认阈值统一为 0.39，默认关闭三实例扫描（FACE_CONTAINER_SWEEP=1 可显式开启）。
 上一轮 c5df5a9 汇总 F1=0.972222，0.39 对应实例 accuracy=0.9771，为扫描最优。
 本轮补齐照片/URL 识别响应的 image_size；保留像素 xywh bbox 和归一化 xywh bbox_relative。
-平均 IoU=0 的直接原因尚未确认；上游插件只在 NMS 内计算 IoU，不负责榜单平均 IoU。
+平均 IoU=0 的**根因已定位并修复**（见 §10.D）：榜单按 [0-1] 归一化相对坐标读框，
+而本轮 faces[].bbox 给的是像素 xywh，故逐样本交并面积为 0。
 识别器下载: http://172.28.4.81:34567/face/edgeface_base.int8.onnx
 SHA256: 8a97eddb4dbba95511f4160c88957d69a75edaa288d8d93afbbaad9a7b6e997a
 33 项人脸测试通过；模型文件未变，此前下载地址与本地文件校验和一致。
@@ -847,6 +851,57 @@ env:
   - name: JP_VERSION
     value: "6,5"
 
+--------------------------------------------------------------------------------
+10.D 坐标修复版 (本轮新增, 修复榜单平均IoU=0, 与上面三版共存)
+--------------------------------------------------------------------------------
+
+动机: 榜单反馈"人脸识别榜的 bbox 需要输出 [0-1] 归一化相对坐标（原点左上角，
+x 向右、y 向下；x、w 除以图片宽度，y、h 除以图片高度），v2 榜的输出不是相对坐标，
+v1 榜是"。据此定位：评测侧 v2 记录读取的字段是 `pred_bbox`，而其值来自我们
+faces[].bbox —— 那一项此前是**像素 xywh**，与归一化真值框 `gt_bbox` 求交恒为空集，
+逐样本 IoU 全为 0 → 平均 IoU = 0。v1 记录读的是 `pred_bbox_relative`（归一化），
+所以 v1 正常。
+
+证据 (评测方提供的记录):
+- v2 记录: gt_bbox={"x":0.273026,"y":0.245179,"w":0.506579,"h":0.506887} (归一化)，
+  pred_bbox=[82.92379760742188,87.49091339111328,148.29898071289062,183.08361053466797]
+  (像素)，与 darvin.log:3886 的 faces[0].bbox 逐字节一致 → 即 10.A/10.B/10.C 的
+  像素 xywh 被当作归一化读入，交集为空。
+- v1 记录: pred_bbox_relative=[0.272784,0.241021,0.487809,0.504372] 对
+  gt_bbox_relative={"x":0.273026,...} → IoU 非 0，v1 正常。
+
+改动 (perception/plugins/face.py 的 `_face_result`, 一处):
+  _face_result 现在先算归一化框 relative = [x/W, y/H, w/W, h/H]，然后
+    "bbox":          relative        # 归一化 xywh —— 榜单读取的字段，v2 兼容
+    "bbox_relative": list(relative)  # 归一化 xywh —— v1 兼容
+    "bbox_px":       [x, y, w, h]    # 像素 xywh —— 仅供调试，不改语义
+  即 bbox 与 bbox_relative 同值（均为 [0-1] 归一化 xywh），像素框降级为 bbox_px。
+  坐标语义本身未改（仍是左上角原点、x 向右、y 向下、xywh）。
+
+与上一版 (10.C, 740ef93) 的差异: 仅 `_face_result` 的返回字典字段（bbox 由像素改
+归一化、新增 bbox_px）；设备字段、阈值、模型、FPS 目标均与 10.C 相同。
+Dockerfile / config.yaml 与 10.C 完全一致。
+
+预期: 榜单 v2 的 pred_bbox 变为归一化后，与 v1 的 pred_bbox_relative 同为归一化，
+平均 IoU 由 0 回升到 v1 量级（预测框与真值框仍有约 0.0188 的宽度差，故 IoU ≈ 0.9
+而非 1.0，与 v1 一致）。身份指标不受影响（本次 accuracy 0.9680/0.9771/0.9771，
+f1=0.9743，只在刷框字段）。
+
+测试: perception/tests/test_face_registration.py 的 bbox 断言同步更新为
+  faces[0]['bbox'] == [0,0,.2,.4] (归一化) 且 faces[0]['bbox_px'] == [0,0,8,8] (像素)。
+208 passed / 1 skipped。
+
+模型文件未变，与 10.A/10.B/10.C 同一份 25,646,022 字节。
+提交信息如下:
+
+env:
+  - name: PHANTHYMOTUS_COMMIT_ID
+    value: "de68efc01aa6ade968bfaa34dc373690aa7d67de"
+  - name: PHANTHYMOTUS_REPO
+    value: "https://github.com/gaogaoonholiday/phanthymotus.git"
+  - name: JP_VERSION
+    value: "6,5"
+
 说明:
 - PHANTHYMOTUS_COMMIT_ID: 你 fork 仓库上推送的 commit hash
 - PHANTHYMOTUS_REPO: 你个人 fork 仓库的 HTTPS clone 地址
@@ -856,8 +911,9 @@ env:
     "5"    → 只在 JP5 机器上跑
 - CPU 版对应 26db84e (config face.device: cpu)；GPU 版对应 d5fc5e1
   (config face.device: gpu，唯一差异)；拆分版对应 740ef93 (config 新增
-  detector_device/recognizer_device，未设置时回落到 device)。三版均已推送，
-  可按需切换提交。
+  detector_device/recognizer_device，未设置时回落到 device)；坐标修复版对应
+  de68efc (在 740ef93 基础上改 plugins/face.py 的 _face_result 框字段)。四版均已
+  推送，可按需切换提交。
 
 提交后榜单会自动:
 1. 拉取你的 fork 仓库代码
@@ -904,6 +960,7 @@ env:
   bbox 输出确认:
   - 所有识别路径统一返回 bbox_relative=[x/W, y/H, w/W, h/H]
   - bbox_relative 各分量在 [0,1] 内; bbox 保留像素 xywh 供调试/兼容使用
+  - (本节为历史记录；10.D 起 bbox 亦改为归一化 xywh，像素框移至 bbox_px，见 §10.D)
 
 ================================================================================
 10.2 新版榜单接口适配 (dfacd04, 2026-09-17)
